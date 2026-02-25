@@ -4,7 +4,7 @@
 import json
 import os
 import sys
-from pathlib import Path
+from pathlib import Path, PurePath
 
 from openai import OpenAI
 
@@ -21,7 +21,7 @@ def _load_gitignore_patterns(root: Path) -> list[str]:
         return []
 
     patterns: list[str] = []
-    for raw in gi.read_text().splitlines():
+    for raw in gi.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -103,7 +103,7 @@ def collect_files(root: Path) -> dict[str, str]:
             continue
 
         try:
-            files[rel] = path.read_text()
+            files[rel] = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, PermissionError):
             pass
     return files
@@ -128,41 +128,107 @@ def build_prompt(files: dict[str, str]) -> str:
     )
 
 
-def validate_path(rel: str, root: Path) -> Path:
-    """Resolve a relative path under root, rejecting traversals and symlinks."""
-    resolved = (root / rel).resolve()
-    if not str(resolved).startswith(str(root.resolve()) + os.sep) and resolved != root.resolve():
-        raise ValueError(f"path traversal rejected: {rel}")
-    # Check each ancestor for symlinks (before the file itself may be created)
+def _reject_path_traversal(rel: str) -> None:
+    """Reject paths that express traversal or are otherwise unsafe.
+
+    Spec requirement: ensure there are no file path traversals expressed by keys.
+    """
+    if not isinstance(rel, str):
+        raise ValueError("path must be a string")
+    if rel == "" or rel.strip() == "":
+        raise ValueError("empty path rejected")
+    if "\x00" in rel:
+        raise ValueError("NUL byte in path rejected")
+
+    # Disallow backslashes to avoid alternate separators on Windows and ambiguity.
+    if "\\" in rel:
+        raise ValueError(f"backslash in path rejected: {rel}")
+
+    p = PurePath(rel)
+
+    # Absolute paths or drive-qualified paths are rejected.
+    if p.is_absolute() or getattr(p, "drive", ""):
+        raise ValueError(f"absolute/drive path rejected: {rel}")
+
+    # Reject traversal and no-op segments.
+    if any(part in {"..", "."} for part in p.parts):
+        raise ValueError(f"path traversal segment rejected: {rel}")
+
+
+def _assert_no_symlink_ancestors(root: Path, rel: str) -> None:
+    """Ensure no existing ancestor in rel is a symlink, and the final target isn't either."""
     current = root
-    for part in Path(rel).parts[:-1]:
+    parts = Path(rel).parts
+
+    for part in parts[:-1]:
         current = current / part
         if current.exists() and current.is_symlink():
             raise ValueError(f"symlink in path rejected: {current}")
-    # Reject if the target itself is an existing symlink
+
     target = root / rel
     if target.exists() and target.is_symlink():
         raise ValueError(f"symlink target rejected: {rel}")
+
+
+def validate_path(rel: str, root: Path) -> Path:
+    """Resolve a relative path under root, rejecting traversals and symlinks."""
+    _reject_path_traversal(rel)
+
+    resolved = (root / rel).resolve()
+    root_resolved = root.resolve()
+
+    # Ensure the resolved path stays within root.
+    if not str(resolved).startswith(str(root_resolved) + os.sep) and resolved != root_resolved:
+        raise ValueError(f"path traversal rejected: {rel}")
+
+    _assert_no_symlink_ancestors(root, rel)
     return resolved
+
+
+def _safe_write_text(target: Path, content: str) -> None:
+    """Write text to target while resisting symlink tricks (best-effort)."""
+    if not isinstance(content, str):
+        raise ValueError(f"file contents for {target} must be a string")
+
+    # Best-effort: refuse to follow a symlink as the final component on platforms
+    # that support O_NOFOLLOW.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    fd = os.open(str(target), flags, 0o644)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
+    finally:
+        # fdopen closes fd on exit; if an exception happened before fdopen, close here.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def apply_changes(changes: dict, root: Path) -> None:
     """Apply create-or-update and delete operations."""
     for rel, content in changes.get("create-or-update", {}).items():
-        if Path(rel).parts[0] == ".git":
+        if Path(rel).parts and Path(rel).parts[0] == ".git":
             print(f"  skipping .git path: {rel}", file=sys.stderr)
             continue
         target = validate_path(rel, root)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content)
+        # Re-check after mkdir (best-effort against symlink races).
+        _assert_no_symlink_ancestors(root, rel)
+        _safe_write_text(target, content)
         print(f"  wrote: {rel}", file=sys.stderr)
 
     for rel in changes.get("delete", []):
-        if Path(rel).parts[0] == ".git":
+        if Path(rel).parts and Path(rel).parts[0] == ".git":
             print(f"  skipping .git path: {rel}", file=sys.stderr)
             continue
         target = validate_path(rel, root)
         if target.exists():
+            if target.is_dir():
+                raise IsADirectoryError(f"refusing to delete directory (files only): {rel}")
             target.unlink()
             print(f"  deleted: {rel}", file=sys.stderr)
 
@@ -174,10 +240,13 @@ def main() -> None:
 
     print(f"Collected {len(files)} files, sending to LLM...", file=sys.stderr)
 
-    client = OpenAI()
+    # Spec: use the most advanced model (currently gpt-5.2) with high reasoning,
+    # and a 1 hour timeout on requests.
+    client = OpenAI(timeout=60 * 60)
     response = client.chat.completions.create(
         model="gpt-5.2",
         messages=[{"role": "user", "content": prompt}],
+        reasoning_effort="high",
         response_format={"type": "json_object"},
     )
 
