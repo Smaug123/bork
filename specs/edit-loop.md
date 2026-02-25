@@ -5,7 +5,10 @@ description: Defines the algorithm a coding harness uses to invoke an LLM and br
 
 Codebases are small enough that we can simply concatenate the entire codebase (omitting `.gitignore`'d files), along with every spec, and determine divergences from the spec.
 
-The coding harness does this concatenation using some reasonable mechanism to indicate the breaks between files, and filepaths, and sends the request to the LLM to bring the codebase into compliance with the immutable specs.
+The coding harness does this concatenation using some reasonable mechanism to indicate the breaks between files, using filepaths to indicate what each file is, and it sends the request to the LLM to bring the codebase into compliance with the immutable specs.
+
+If the `specs/` folder is different from how it appears on the `main` branch (including new unstaged files), that diff is also supplied to the LLM, to highlight that this particular reconciliation is probably a "task to be performed/verified".
+New unstaged files are not represented twice in the LLM input, but instead their filepath is indicated as being "newly added".
 
 The LLM returns JSON of this format, where the keys of the `create-or-update` object indicate what files should exist (*not* including the specs, which are immutable from the point of view of the LLM):
 
