@@ -3,7 +3,7 @@ id: core/edit-loop
 description: Defines the algorithm a coding harness uses to invoke an LLM and bring a codebase in sync with a collection of specs.
 ------
 
-Codebases are small enough that we can simply concatenate the entire codebase, along with every spec, and determine divergences from the spec.
+Codebases are small enough that we can simply concatenate the entire codebase (omitting `.gitignore`'d files), along with every spec, and determine divergences from the spec.
 
 The coding harness does this concatenation using some reasonable mechanism to indicate the breaks between files, and filepaths, and sends the request to the LLM to bring the codebase into compliance with the immutable specs.
 

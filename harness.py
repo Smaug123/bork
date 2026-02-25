@@ -11,15 +11,97 @@ from openai import OpenAI
 SKIP_DIRS = {".git", ".direnv", "__pycache__", ".claude"}
 
 
+def _load_gitignore_patterns(root: Path) -> list[str]:
+    """Load top-level .gitignore patterns if present.
+
+    This is a minimal parser sufficient for typical ignore use in this repo.
+    """
+    gi = root / ".gitignore"
+    if not gi.exists():
+        return []
+
+    patterns: list[str] = []
+    for raw in gi.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # ignore negation for now; spec only requires omitting gitignored files
+        if line.startswith("!"):
+            continue
+        patterns.append(line)
+    return patterns
+
+
+def _is_ignored(rel: str, patterns: list[str]) -> bool:
+    """Return True if rel path matches any .gitignore-like pattern.
+
+    Supports:
+      - exact directory ignores like ".venv/" and ".direnv/"
+      - exact file ignores
+      - simple globbing via fnmatch
+    """
+    import fnmatch
+
+    # normalize to forward slashes
+    rel = rel.replace(os.sep, "/")
+
+    parts = rel.split("/")
+    for pat in patterns:
+        pat = pat.strip()
+        if not pat:
+            continue
+        # normalize pattern to forward slashes
+        pat = pat.replace(os.sep, "/")
+
+        # directory pattern like ".venv/": ignore if any path segment equals ".venv"
+        if pat.endswith("/"):
+            d = pat[:-1]
+            if d in parts:
+                return True
+            # also match prefix directory
+            if rel.startswith(d + "/"):
+                return True
+            continue
+
+        # anchored pattern "/foo": treat as repo-root anchored
+        anchored = pat.startswith("/")
+        if anchored:
+            p = pat[1:]
+            if rel == p or rel.startswith(p + "/"):
+                return True
+            # allow glob anchored
+            if fnmatch.fnmatch(rel, p):
+                return True
+            continue
+
+        # unanchored
+        if rel == pat:
+            return True
+        if fnmatch.fnmatch(rel, pat):
+            return True
+        # also match basename for patterns without slashes
+        if "/" not in pat and fnmatch.fnmatch(parts[-1], pat):
+            return True
+
+    return False
+
+
 def collect_files(root: Path) -> dict[str, str]:
-    """Collect all text files in the repo, skipping SKIP_DIRS."""
-    files = {}
+    """Collect all text files in the repo, skipping SKIP_DIRS and .gitignore'd files."""
+    files: dict[str, str] = {}
+    ignore_patterns = _load_gitignore_patterns(root)
+
     for path in sorted(root.rglob("*")):
-        if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
+        rel_path = path.relative_to(root)
+        if any(part in SKIP_DIRS for part in rel_path.parts):
             continue
         if not path.is_file():
             continue
-        rel = str(path.relative_to(root))
+
+        rel = str(rel_path)
+        if _is_ignored(rel, ignore_patterns):
+            continue
+
         try:
             files[rel] = path.read_text()
         except (UnicodeDecodeError, PermissionError):
