@@ -20,6 +20,8 @@
           packages = [
             pkgs.claude-code
             pkgs.codex
+            pkgs.uv
+            pkgs.python3
           ];
         };
       });
