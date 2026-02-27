@@ -3,14 +3,19 @@ id: core/edit-loop
 description: Defines the algorithm a coding harness uses to invoke an LLM and bring a codebase in sync with a collection of specs.
 ------
 
-Codebases are small enough that we can simply concatenate the entire codebase (omitting `.gitignore`'d files), along with every spec, and determine divergences from the spec.
+# Input format
 
-The coding harness does this concatenation using some reasonable mechanism to indicate the breaks between files, using filepaths to indicate what each file is, and it sends the request to the LLM to bring the codebase into compliance with the immutable specs.
+Codebases are small enough that we can simply concatenate the entire codebase (omitting `.gitignore`'d files), along with every spec, and have the LLM determine divergences from the spec within a single context window.
 
-If the `specs/` folder is different from how it appears on the `main` branch (including new unstaged files), that diff is also supplied to the LLM, to highlight that this particular reconciliation is probably a "task to be performed/verified".
+The coding harness does this concatenation using some reasonable mechanism to indicate the breaks between files, using filepaths to indicate what each file is, and it sends the request to the LLM to bring the codebase and specs into sync with each other.
+The model is permitted to change the specs, but is strongly encouraged not to do so.
+
+If the `specs/` folder is locally different from how it appears on the `main` branch (including new unstaged files), that diff is also supplied to the LLM, to highlight that this particular reconciliation is probably a "task to be performed/verified".
 New unstaged files are not represented twice in the LLM input, but instead their filepath is indicated as being "newly added".
 
-The LLM returns JSON of this format, where the keys of the `create-or-update` object indicate what files should exist (*not* including the specs, which are immutable from the point of view of the LLM):
+# Final output format
+
+The LLM returns JSON of this format, where the keys of the `create-or-update` object indicate what files should exist:
 
 ```json
 {
@@ -21,6 +26,16 @@ The LLM returns JSON of this format, where the keys of the `create-or-update` ob
 }
 ```
 
-The coding harness simply replaces the files in `create-or-update` with the specified file contents, and deletes files which are specified in the `delete` list; there is a carve-out for the `.git` directory, which the harness never touches.
+Files in `specs` *may* appear in this output, but the model is strongly encouraged not to change the specs.
 
-The coding harness ensures that there are no file path traversals expressed by those keys and no symlink attacks when writing the files out.
+# Action taken in response to final output
+
+With a couple of exceptions, the coding harness simply replaces the files in `create-or-update` with the specified file contents, and deletes files which are specified in the `delete` list.
+
+The exceptions are:
+
+* the `.git` directory, which the harness never touches;
+* any attempts at filesystem traversal, including (for example) `../foo`
+* changes to `specs/`, which can be made but require individual human approval for each change.
+
+The harness prevents symlink attacks when writing the files out.
