@@ -1,4 +1,4 @@
-FROM ghcr.io/nixos/nix:2.22.1
+FROM nixos/nix:2.32.6
 
 # Enable flakes inside the container, and disable Nix sandboxing (commonly required in Docker).
 ENV NIX_CONFIG="experimental-features = nix-command flakes\naccept-flake-config = true\nsandbox = false\n"
