@@ -727,6 +727,38 @@ def _read_bork_config(root: Path) -> tuple[dict | None, str | None]:
     return data, None
 
 
+def _correctness_checker_configured_for_loop(root: Path) -> bool:
+    """Return True iff a correctness checker appears to be configured.
+
+    This is used to implement the edit-loop rule:
+      - Only loop once when there is no correctness checker.
+
+    If the config file exists but is unreadable/invalid, we conservatively return True
+    (treating the project as intending to use a checker).
+    """
+    cfg_path = root / CONFIG_REL_PATH
+    if not cfg_path.exists():
+        return False
+
+    try:
+        raw = cfg_path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except Exception:
+        return True
+
+    if not isinstance(data, dict):
+        return True
+
+    if "correctness-checker" not in data:
+        return False
+
+    # If explicitly null, treat as not configured.
+    if data.get("correctness-checker") is None:
+        return False
+
+    return True
+
+
 def _decode_utf8_or_placeholder(b: bytes) -> str:
     try:
         return b.decode("utf-8")
@@ -931,8 +963,10 @@ def _wants_changes(changes: dict) -> bool:
 def main() -> None:
     root = Path.cwd()
 
-    # Spec: run reconciliation loop until convergence or cycle limit reached.
-    max_iterations = 5
+    # Spec: only loop once when there is no correctness checker configured.
+    checker_configured_for_loop = _correctness_checker_configured_for_loop(root)
+    max_iterations = 5 if checker_configured_for_loop else 1
+
     appended_failures: list[str] = []
 
     # Spec: use the most advanced model (currently gpt-5.2) with high reasoning,
@@ -949,6 +983,7 @@ def main() -> None:
             "--- HARNESS CONTEXT ---",
             f"Iteration: {iteration} / {max_iterations}",
             f"Protected (never edited) path: {CONFIG_REL_PATH}",
+            f"Correctness checker configured (controls loop mode): {checker_configured_for_loop}",
             "--- END HARNESS CONTEXT ---",
         ]
         if appended_failures:
@@ -983,7 +1018,13 @@ def main() -> None:
             print("Applying changes...", file=sys.stderr)
             apply_changes(changes, root)
 
-            ok, details, checker_configured = run_correctness_checks(root)
+            ok, details, checker_was_configured = run_correctness_checks(root)
+
+            # Spec: only loop once when there is no correctness checker.
+            if not checker_configured_for_loop:
+                print(f"Correctness checks: {details}", file=sys.stderr)
+                print("No correctness checker configured; single iteration complete.", file=sys.stderr)
+                return
 
             # Spec: if five iterations take place and the model is still requesting changes,
             # apply those changes and then break out, requesting human intervention.
@@ -1003,16 +1044,16 @@ def main() -> None:
             print(f"Correctness checks: {details}", file=sys.stderr)
 
             # Spec: if there are no findings from the correctness checker after a change is applied,
-            # the loop ends. Only apply this rule when a checker was actually configured.
-            if checker_configured:
+            # the loop ends.
+            if checker_was_configured:
                 print("No findings from correctness checker; ending loop.", file=sys.stderr)
                 return
 
-            # No checker configured; keep iterating until the model converges.
+            # Defensive: checker_configured_for_loop should imply a checker is configured.
             continue
 
-        # No changes requested by the model: we are at convergence unless checks fail.
-        ok, details, _checker_configured = run_correctness_checks(root)
+        # No changes requested by the model.
+        ok, details, _checker_was_configured = run_correctness_checks(root)
         if ok:
             print(f"Converged. Correctness checks: {details}", file=sys.stderr)
             return
