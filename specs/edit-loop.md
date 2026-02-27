@@ -37,10 +37,11 @@ With a couple of exceptions, the coding harness simply replaces the files in `cr
 
 The exceptions are:
 
-* the `.git` directory, which the harness never touches;
-* the [`.config/bork.json` configuration file](./config-file.md) (which configures the harness and cannot be edited by Bork itself);
-* any attempts at filesystem traversal, including (for example) `../foo`;
-* changes to `specs/`, which can be made but require individual human approval for each change.
+* the `.git` directory, which the harness never reads or writes, not even asking the user to approve changes;
+* the [`.config/bork.json` configuration file](./config-file.md) (which configures the harness, and again the harness will neither edit nor ask the user to approve changes to this file);
+* any attempts at filesystem traversal, including (for example) `../foo`, not even asking the user to approve changes;
+* changes to `specs/`, which can be made but require individual human approval for each change;
+* changes to any files configured in the configuration file's `edits-require-approval` list.
 
 The harness prevents symlink attacks when writing the files out.
 
