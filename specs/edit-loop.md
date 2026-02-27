@@ -1,7 +1,8 @@
+---
 kind: spec
 id: core/edit-loop
 description: Defines the algorithm a coding harness uses to invoke an LLM and bring a codebase in sync with a collection of specs.
-------
+---
 
 # Input format
 
