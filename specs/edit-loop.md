@@ -4,7 +4,7 @@ id: core/edit-loop
 description: Defines the algorithm a coding harness uses to invoke an LLM and bring a codebase in sync with a collection of specs.
 ---
 
-The system runs a reconciliation loop until convergence or until a cycle limit is reached.
+The Bork system runs a reconciliation loop until convergence or until a cycle limit is reached.
 
 # Initial input format
 
@@ -38,16 +38,16 @@ With a couple of exceptions, the coding harness simply replaces the files in `cr
 The exceptions are:
 
 * the `.git` directory, which the harness never touches;
-* any attempts at filesystem traversal, including (for example) `../foo`
+* the [`.config/bork.json` configuration file](./config-file.md) (which configures the harness and cannot be edited by Bork itself);
+* any attempts at filesystem traversal, including (for example) `../foo`;
 * changes to `specs/`, which can be made but require individual human approval for each change.
 
 The harness prevents symlink attacks when writing the files out.
 
 # Commencing the next loop
 
-Once the harness has written the output, it performs any correctness checks which may be specified.
-(This correctness-checking is currently implemented only with a placeholder that always returns "code is correct", because the contract between the harness and the correctness-checker is currently unspecified.)
-If any correctness checks fail, the harness commences a new loop, this time appending to the prompt the failing output.
+Once the harness has written the output, it performs any correctness checks which may be specified, by running [the correctness checker](./correctness-checker.md) if it exists.
+If any correctness checks fail, the harness commences a new loop, this time appending to the prompt the failing output in a format the LLM can consume.
 
 # Breaking out of the loop
 
