@@ -1,7 +1,8 @@
+---
 kind: spec
 id: core/spec-format
 description: Defines the format for user-generated specification documents.
-------
+---
 
 Feature specs, stored in `specs/*.md`, are given as Markdown files with YAML frontmatter.
 
