@@ -51,6 +51,7 @@ If any correctness checks fail, the harness commences a new loop, this time appe
 
 # Breaking out of the loop
 
-If there are no findings from the correctness checker after a change is applied, the loop ends.
+If there are no findings from a correctness checker after a change is applied, the loop ends.
+(Only loop once when there is no correctness checker.)
 
 Alternatively, if five iterations take place and the model is still requesting changes, the harness applies those changes and then breaks out of the loop, requesting human intervention.
