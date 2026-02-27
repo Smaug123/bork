@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Coding harness: reads specs and codebase, asks an LLM to bring codebase into compliance."""
+"""Coding harness: reads specs and codebase, asks an LLM to bring codebase into compliance.
+
+Implements the reconciliation loop defined in specs/edit-loop.md.
+"""
 
 import difflib
 import errno
@@ -235,6 +238,7 @@ def build_prompt(
     specs_baseline_ref: str | None = None,
     specs_diff_text: str = "",
     newly_added_specs: set[str] | None = None,
+    appended_text: str = "",
 ) -> str:
     """Build the concatenated codebase + specs prompt."""
     newly_added_specs = newly_added_specs or set()
@@ -272,6 +276,8 @@ def build_prompt(
             parts.append(f"--- FILE: {path} ---\n{content}\n--- END FILE: {path} ---")
 
     joined = "\n\n".join([*extra_sections, *parts])
+    if appended_text.strip():
+        joined = "\n\n".join([joined, appended_text.strip()])
 
     return (
         "You are a coding agent. Below is the entire contents of a repository, "
@@ -651,38 +657,106 @@ def apply_changes(changes: dict, root: Path) -> None:
             )
 
 
+def run_correctness_checks(root: Path) -> tuple[bool, str]:
+    """Run correctness checks.
+
+    Placeholder implementation per spec: always returns (True, "code is correct").
+    """
+    _ = root
+    return True, "code is correct"
+
+
+def _wants_changes(changes: dict) -> bool:
+    create_map = changes.get("create-or-update", {}) or {}
+    delete_list = changes.get("delete", []) or []
+    if not isinstance(create_map, dict) or not isinstance(delete_list, list):
+        raise ValueError("LLM output must include 'create-or-update' object and 'delete' list")
+    return bool(create_map) or bool(delete_list)
+
+
 def main() -> None:
     root = Path.cwd()
 
-    specs_baseline, specs_diff_text, untracked_specs = compute_specs_status(root)
-    newly_added_specs = set(untracked_specs)
-
-    files = collect_files(root)
-    prompt = build_prompt(
-        files,
-        specs_baseline_ref=specs_baseline,
-        specs_diff_text=specs_diff_text,
-        newly_added_specs=newly_added_specs,
-    )
-
-    print(f"Collected {len(files)} files, sending to LLM...", file=sys.stderr)
+    # Spec: run reconciliation loop until convergence or cycle limit reached.
+    max_iterations = 5
+    appended_failures: list[str] = []
 
     # Spec: use the most advanced model (currently gpt-5.2) with high reasoning,
     # and a 1 hour timeout on requests.
     client = OpenAI(timeout=60 * 60)
-    response = client.chat.completions.create(
-        model="gpt-5.2",
-        messages=[{"role": "user", "content": prompt}],
-        reasoning_effort="high",
-        response_format={"type": "json_object"},
-    )
 
-    raw = response.choices[0].message.content
-    changes = json.loads(raw)
+    for iteration in range(1, max_iterations + 1):
+        specs_baseline, specs_diff_text, untracked_specs = compute_specs_status(root)
+        newly_added_specs = set(untracked_specs)
 
-    print("Applying changes...", file=sys.stderr)
-    apply_changes(changes, root)
-    print("Done.", file=sys.stderr)
+        files = collect_files(root)
+
+        appendix_parts: list[str] = [
+            "--- HARNESS CONTEXT ---",
+            f"Iteration: {iteration} / {max_iterations}",
+            "--- END HARNESS CONTEXT ---",
+        ]
+        if appended_failures:
+            appendix_parts.append("--- CORRECTNESS CHECK FAILURES (most recent last) ---")
+            appendix_parts.extend(appended_failures)
+            appendix_parts.append("--- END CORRECTNESS CHECK FAILURES ---")
+
+        prompt = build_prompt(
+            files,
+            specs_baseline_ref=specs_baseline,
+            specs_diff_text=specs_diff_text,
+            newly_added_specs=newly_added_specs,
+            appended_text="\n".join(appendix_parts),
+        )
+
+        print(f"Collected {len(files)} files; iteration {iteration}/{max_iterations}; sending to LLM...", file=sys.stderr)
+
+        response = client.chat.completions.create(
+            model="gpt-5.2",
+            messages=[{"role": "user", "content": prompt}],
+            reasoning_effort="high",
+            response_format={"type": "json_object"},
+        )
+
+        raw = response.choices[0].message.content
+        if raw is None:
+            raise ValueError("LLM returned empty content")
+
+        changes = json.loads(raw)
+
+        if _wants_changes(changes):
+            print("Applying changes...", file=sys.stderr)
+            apply_changes(changes, root)
+
+            ok, details = run_correctness_checks(root)
+            if not ok:
+                appended_failures.append(details)
+                print("Correctness checks failed; commencing next loop.", file=sys.stderr)
+            else:
+                print(f"Correctness checks: {details}", file=sys.stderr)
+
+            if iteration >= max_iterations:
+                print(
+                    "Cycle limit reached (5 iterations) and model is still requesting changes. "
+                    "Latest changes were applied; human intervention requested.",
+                    file=sys.stderr,
+                )
+                return
+
+            # Continue loop (even if checks passed) until model converges.
+            continue
+
+        # No changes requested by the model: we are at convergence unless checks fail.
+        ok, details = run_correctness_checks(root)
+        if ok:
+            print(f"Converged. Correctness checks: {details}", file=sys.stderr)
+            return
+
+        appended_failures.append(details)
+        print("Model requested no changes, but correctness checks failed; commencing next loop.", file=sys.stderr)
+
+    # Defensive: loop should have returned.
+    print("Cycle limit reached; human intervention requested.", file=sys.stderr)
 
 
 if __name__ == "__main__":

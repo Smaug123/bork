@@ -4,7 +4,9 @@ id: core/edit-loop
 description: Defines the algorithm a coding harness uses to invoke an LLM and bring a codebase in sync with a collection of specs.
 ---
 
-# Input format
+The system runs a reconciliation loop until convergence or until a cycle limit is reached.
+
+# Initial input format
 
 Codebases are small enough that we can simply concatenate the entire codebase (omitting `.gitignore`'d files), along with every spec, and have the LLM determine divergences from the spec within a single context window.
 
@@ -14,7 +16,7 @@ The model is permitted to change the specs, but is strongly encouraged not to do
 If the `specs/` folder is locally different from how it appears on the `main` branch (including new unstaged files), that diff is also supplied to the LLM, to highlight that this particular reconciliation is probably a "task to be performed/verified".
 New unstaged files are not represented twice in the LLM input, but instead their filepath is indicated as being "newly added".
 
-# Final output format
+# Output format
 
 The LLM returns JSON of this format, where the keys of the `create-or-update` object indicate what files should exist:
 
@@ -29,7 +31,7 @@ The LLM returns JSON of this format, where the keys of the `create-or-update` ob
 
 Files in `specs` *may* appear in this output, but the model is strongly encouraged not to change the specs.
 
-# Action taken in response to final output
+# Action taken in response to output
 
 With a couple of exceptions, the coding harness simply replaces the files in `create-or-update` with the specified file contents, and deletes files which are specified in the `delete` list.
 
@@ -40,3 +42,13 @@ The exceptions are:
 * changes to `specs/`, which can be made but require individual human approval for each change.
 
 The harness prevents symlink attacks when writing the files out.
+
+# Commencing the next loop
+
+Once the harness has written the output, it performs any correctness checks which may be specified.
+(This correctness-checking is currently implemented only with a placeholder that always returns "code is correct", because the contract between the harness and the correctness-checker is currently unspecified.)
+If any correctness checks fail, the harness commences a new loop, this time appending to the prompt the failing output.
+
+# Breaking out of the loop
+
+If five iterations take place and the model is still requesting changes, the harness applies those changes and then breaks out of the loop, requesting human intervention.
