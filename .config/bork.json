@@ -1,0 +1,7 @@
+{
+    "edits-require-approval": [
+        "flake.nix",
+        "flake.lock",
+        ".envrc"
+    ]
+}
