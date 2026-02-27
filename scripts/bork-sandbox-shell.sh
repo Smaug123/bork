@@ -6,6 +6,11 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 2
 fi
 
+if [ ! -f "./flake.nix" ] || [ ! -f "./docker/Dockerfile" ]; then
+  echo "Expected ./flake.nix and ./docker/Dockerfile. Run from the repository root." >&2
+  exit 2
+fi
+
 default_image="${BORK_DEFAULT_SANDBOX_TAG:-bork-dev-sandbox:latest}"
 image="${1:-$default_image}"
 
@@ -22,11 +27,13 @@ if ! docker image inspect "$image" >/dev/null 2>&1; then
   exit 2
 fi
 
-# Mount only the working tree (the Git repo) from the host.
+repo_root="$(pwd -P)"
+
+# Mount only the repository working tree from the host.
 # Pass through common API-related environment variables.
 # Enter the flake's devShell inside the container.
 docker run --rm -it \
-  --mount "type=bind,source=$PWD,target=/workspace" \
+  --mount "type=bind,source=$repo_root,target=/workspace" \
   -w /workspace \
   -e OPENAI_API_KEY \
   -e OPENAI_BASE_URL \
@@ -37,4 +44,4 @@ docker run --rm -it \
   -e NO_PROXY \
   -e ANTHROPIC_API_KEY \
   "$image" \
-  nix develop
+  nix --extra-experimental-features "nix-command flakes" --accept-flake-config develop

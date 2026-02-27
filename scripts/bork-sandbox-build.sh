@@ -6,8 +6,8 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 2
 fi
 
-if [ ! -f "./docker/Dockerfile" ]; then
-  echo "Expected ./docker/Dockerfile. Run from the repository root." >&2
+if [ ! -f "./flake.nix" ] || [ ! -f "./docker/Dockerfile" ]; then
+  echo "Expected ./flake.nix and ./docker/Dockerfile. Run from the repository root." >&2
   exit 2
 fi
 
