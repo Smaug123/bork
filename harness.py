@@ -2,6 +2,12 @@
 """Coding harness: reads specs and codebase, asks an LLM to bring codebase into compliance.
 
 Implements the reconciliation loop defined in specs/edit-loop.md.
+
+Notably:
+- Omits `.gitignore`'d files from the prompt.
+- Does not modify `.git/`.
+- Does not modify `.config/bork.json` (user configuration).
+- Can run an optional correctness checker configured in `.config/bork.json`.
 """
 
 import difflib
@@ -16,6 +22,9 @@ from pathlib import Path, PurePath
 from openai import OpenAI
 
 SKIP_DIRS = {".git", ".direnv", "__pycache__", ".claude"}
+
+CONFIG_REL_PATH = ".config/bork.json"
+PROTECTED_REL_PATHS = {CONFIG_REL_PATH}
 
 
 def _load_gitignore_patterns(root: Path) -> list[str]:
@@ -319,15 +328,31 @@ def _reject_path_traversal(rel: str) -> None:
         raise ValueError(f"path traversal segment rejected: {rel}")
 
 
+def _normalize_rel_path(rel: str) -> str:
+    """Normalize a validated relative path for comparisons.
+
+    This collapses redundant separators (e.g. ".config//bork.json"), without allowing
+    traversal (which is rejected earlier).
+    """
+    return PurePath(rel).as_posix()
+
+
 def _dir_fd_capable() -> bool:
     """Return True if this platform/Python supports *at() style operations via dir_fd."""
+    # We test whether os.open accepts the keyword-only dir_fd parameter.
+    # IMPORTANT: close the fd on success to avoid leaking descriptors.
     try:
-        os.open(".", os.O_RDONLY, dir_fd=None)  # type: ignore[arg-type]
-        return True
+        fd = os.open(".", os.O_RDONLY, dir_fd=None)  # type: ignore[arg-type]
     except TypeError:
         return False
     except OSError:
         # If this errors for reasons other than TypeError, dir_fd is likely supported.
+        return True
+    else:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         return True
 
 
@@ -547,6 +572,11 @@ def _approve_spec_change(rel: str, *, action: str) -> bool:
     return ans.strip().lower() == "yes"
 
 
+def _is_protected_path(rel: str) -> bool:
+    # Paths are already traversal-checked and backslashes are rejected.
+    return _normalize_rel_path(rel) in PROTECTED_REL_PATHS
+
+
 def apply_changes(changes: dict, root: Path) -> None:
     """Apply create-or-update and delete operations."""
 
@@ -589,6 +619,9 @@ def apply_changes(changes: dict, root: Path) -> None:
         if parts and parts[0] == ".git":
             print(f"  skipping .git path: {rel}", file=sys.stderr)
             continue
+        if _is_protected_path(rel):
+            print(f"  skipping protected config path: {rel}", file=sys.stderr)
+            continue
 
         safe_write_text_under_root(root, rel, content)
         print(f"  wrote: {rel}", file=sys.stderr)
@@ -598,8 +631,16 @@ def apply_changes(changes: dict, root: Path) -> None:
         if parts and parts[0] == ".git":
             print(f"  skipping .git path: {rel}", file=sys.stderr)
             continue
+        if _is_protected_path(rel):
+            print(f"  skipping protected config path: {rel}", file=sys.stderr)
+            continue
 
-        safe_delete_under_root(root, rel)
+        try:
+            safe_delete_under_root(root, rel)
+        except IsADirectoryError:
+            # Spec says delete files; if the model requests directory deletion, ignore.
+            print(f"  skipping directory delete request: {rel}", file=sys.stderr)
+            continue
         print(f"  deleted: {rel}", file=sys.stderr)
 
     # Handle spec changes with per-file approval.
@@ -638,8 +679,12 @@ def apply_changes(changes: dict, root: Path) -> None:
 
         print(f"\n--- PROPOSED SPEC DELETE: {rel} ---", file=sys.stderr)
         if _approve_spec_change(rel, action="delete"):
-            safe_delete_under_root(root, rel)
-            print(f"  deleted (approved spec change): {rel}", file=sys.stderr)
+            try:
+                safe_delete_under_root(root, rel)
+            except IsADirectoryError:
+                print(f"  skipping directory delete request (approved spec delete): {rel}", file=sys.stderr)
+            else:
+                print(f"  deleted (approved spec change): {rel}", file=sys.stderr)
         else:
             pending["delete"].append(rel)
             print(f"  pending (spec delete requires approval): {rel}", file=sys.stderr)
@@ -657,13 +702,254 @@ def apply_changes(changes: dict, root: Path) -> None:
             )
 
 
-def run_correctness_checks(root: Path) -> tuple[bool, str]:
+def _read_bork_config(root: Path) -> tuple[dict | None, str | None]:
+    """Read `.config/bork.json` if present.
+
+    Returns: (config_dict_or_none, error_string_or_none)
+    """
+    cfg_path = root / CONFIG_REL_PATH
+    if not cfg_path.exists():
+        return None, None
+
+    try:
+        raw = cfg_path.read_text(encoding="utf-8")
+    except Exception as e:
+        return None, f"failed to read {CONFIG_REL_PATH}: {e}"
+
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        return None, f"invalid JSON in {CONFIG_REL_PATH}: {e}"
+
+    if not isinstance(data, dict):
+        return None, f"{CONFIG_REL_PATH} must contain a JSON object"
+
+    return data, None
+
+
+def _correctness_checker_configured_for_loop(root: Path) -> bool:
+    """Return True iff a correctness checker appears to be configured.
+
+    This is used to implement the edit-loop rule:
+      - Only loop once when there is no correctness checker.
+
+    If the config file exists but is unreadable/invalid, we conservatively return True
+    (treating the project as intending to use a checker).
+    """
+    cfg_path = root / CONFIG_REL_PATH
+    if not cfg_path.exists():
+        return False
+
+    try:
+        raw = cfg_path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except Exception:
+        return True
+
+    if not isinstance(data, dict):
+        return True
+
+    if "correctness-checker" not in data:
+        return False
+
+    # If explicitly null, treat as not configured.
+    if data.get("correctness-checker") is None:
+        return False
+
+    return True
+
+
+def _decode_utf8_or_placeholder(b: bytes) -> str:
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        return "<non-UTF8 output>"
+
+
+def _format_block_for_prompt(title: str, payload: dict) -> str:
+    return "\n".join(
+        [
+            f"--- {title} ---",
+            json.dumps(payload, indent=2, sort_keys=True),
+            f"--- END {title} ---",
+        ]
+    )
+
+
+def _run_correctness_checker(root: Path, checker_cmd: str) -> tuple[bool, str]:
+    """Run the configured correctness checker and interpret its result.
+
+    Contract (per specs/correctness-checker.md):
+      - invoked with no arguments in repo root
+      - exit 0: no findings
+      - exit 1: findings
+      - exit 2: failed to run
+      - stdout: JSON
+    """
+    if not isinstance(checker_cmd, str) or checker_cmd.strip() == "":
+        payload = {
+            "checker": checker_cmd,
+            "assessment": "failed-to-run",
+            "summary": "Invalid correctness-checker value (must be a non-empty string).",
+        }
+        return False, _format_block_for_prompt("CORRECTNESS CHECKER OUTPUT", payload)
+
+    try:
+        proc = subprocess.run(
+            [checker_cmd],
+            cwd=str(root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except FileNotFoundError as e:
+        payload = {
+            "checker": checker_cmd,
+            "exit-code": 2,
+            "assessment": "failed-to-run",
+            "summary": "Correctness checker could not be executed (FileNotFoundError).",
+            "harness-error": str(e),
+        }
+        return False, _format_block_for_prompt("CORRECTNESS CHECKER OUTPUT", payload)
+    except PermissionError as e:
+        payload = {
+            "checker": checker_cmd,
+            "exit-code": 2,
+            "assessment": "failed-to-run",
+            "summary": "Correctness checker could not be executed (PermissionError).",
+            "harness-error": str(e),
+        }
+        return False, _format_block_for_prompt("CORRECTNESS CHECKER OUTPUT", payload)
+    except OSError as e:
+        payload = {
+            "checker": checker_cmd,
+            "exit-code": 2,
+            "assessment": "failed-to-run",
+            "summary": "Correctness checker could not be executed (OSError).",
+            "harness-error": str(e),
+        }
+        return False, _format_block_for_prompt("CORRECTNESS CHECKER OUTPUT", payload)
+
+    stdout = _decode_utf8_or_placeholder(proc.stdout)
+    stderr = _decode_utf8_or_placeholder(proc.stderr)
+    exit_code = proc.returncode
+
+    parsed: object | None = None
+    parse_error: str | None = None
+
+    # Spec requires JSON on stdout; treat missing/invalid JSON as a contract violation.
+    if stdout == "<non-UTF8 output>":
+        parse_error = "stdout was not valid UTF-8"
+    else:
+        if not stdout.strip():
+            parse_error = "stdout was empty; expected JSON"
+        else:
+            try:
+                parsed = json.loads(stdout)
+            except Exception as e:
+                parse_error = f"stdout was not valid JSON: {e}"
+
+    if parse_error is None and not isinstance(parsed, dict):
+        parse_error = f"stdout JSON was not an object (got {type(parsed).__name__})"
+
+    per_file_findings = None
+    overall_findings = None
+    if isinstance(parsed, dict):
+        per_file_findings = parsed.get("per_file_findings")
+        overall_findings = parsed.get("overall_findings")
+
+    findings_count = 0
+    if isinstance(per_file_findings, list):
+        findings_count += len(per_file_findings)
+    if isinstance(overall_findings, list):
+        findings_count += len(overall_findings)
+
+    assessment = "unexpected"
+    ok = False
+
+    if exit_code == 0:
+        if parse_error is not None:
+            assessment = "failed-to-run"
+            ok = False
+        elif findings_count > 0:
+            assessment = "findings"
+            ok = False
+        else:
+            assessment = "no-findings"
+            ok = True
+    elif exit_code == 1:
+        # Findings are only meaningful if we can parse the JSON payload.
+        assessment = "findings" if parse_error is None else "failed-to-run"
+        ok = False
+    elif exit_code == 2:
+        assessment = "failed-to-run"
+        ok = False
+    else:
+        assessment = "unexpected-exit-code"
+        ok = False
+
+    payload: dict = {
+        "checker": checker_cmd,
+        "exit-code": exit_code,
+        "assessment": assessment,
+        "stdout": stdout,
+        "stderr": stderr,
+        "parsed": parsed if isinstance(parsed, dict) else None,
+    }
+    if parse_error is not None:
+        payload["parse-error"] = parse_error
+    if isinstance(per_file_findings, list) or isinstance(overall_findings, list):
+        payload["findings-count"] = findings_count
+
+    if ok:
+        return True, f"correctness checker OK (exit 0, no findings): {checker_cmd}"
+
+    # Failure: return a structured block for the next loop to consume.
+    return False, _format_block_for_prompt("CORRECTNESS CHECKER OUTPUT", payload)
+
+
+def run_correctness_checks(root: Path) -> tuple[bool, str, bool]:
     """Run correctness checks.
 
-    Placeholder implementation per spec: always returns (True, "code is correct").
+    If `.config/bork.json` exists and configures `correctness-checker`, run it.
+
+    Returns:
+      (ok, details, checker_was_configured)
+
+    Where:
+      - ok is True iff checks passed / produced no findings.
+      - details is a human/LLM-consumable string.
+      - checker_was_configured is True iff a `correctness-checker` command was present.
+
+    If no checker is configured, ok=True and checker_was_configured=False.
     """
-    _ = root
-    return True, "code is correct"
+    cfg, err = _read_bork_config(root)
+    if err is not None:
+        payload = {
+            "config": CONFIG_REL_PATH,
+            "assessment": "failed-to-run",
+            "summary": err,
+        }
+        return False, _format_block_for_prompt("CORRECTNESS CHECKER OUTPUT", payload), False
+
+    if cfg is None:
+        return True, f"no {CONFIG_REL_PATH}; skipping correctness checker", False
+
+    checker = cfg.get("correctness-checker")
+    if checker is None:
+        return True, "no correctness-checker configured; skipping correctness checker", False
+
+    if not isinstance(checker, str):
+        payload = {
+            "config": CONFIG_REL_PATH,
+            "assessment": "failed-to-run",
+            "summary": "Field 'correctness-checker' must be a string.",
+            "value": checker,
+        }
+        return False, _format_block_for_prompt("CORRECTNESS CHECKER OUTPUT", payload), False
+
+    ok, details = _run_correctness_checker(root, checker)
+    return ok, details, True
 
 
 def _wants_changes(changes: dict) -> bool:
@@ -677,8 +963,10 @@ def _wants_changes(changes: dict) -> bool:
 def main() -> None:
     root = Path.cwd()
 
-    # Spec: run reconciliation loop until convergence or cycle limit reached.
-    max_iterations = 5
+    # Spec: only loop once when there is no correctness checker configured.
+    checker_configured_for_loop = _correctness_checker_configured_for_loop(root)
+    max_iterations = 5 if checker_configured_for_loop else 1
+
     appended_failures: list[str] = []
 
     # Spec: use the most advanced model (currently gpt-5.2) with high reasoning,
@@ -694,6 +982,8 @@ def main() -> None:
         appendix_parts: list[str] = [
             "--- HARNESS CONTEXT ---",
             f"Iteration: {iteration} / {max_iterations}",
+            f"Protected (never edited) path: {CONFIG_REL_PATH}",
+            f"Correctness checker configured (controls loop mode): {checker_configured_for_loop}",
             "--- END HARNESS CONTEXT ---",
         ]
         if appended_failures:
@@ -728,13 +1018,16 @@ def main() -> None:
             print("Applying changes...", file=sys.stderr)
             apply_changes(changes, root)
 
-            ok, details = run_correctness_checks(root)
-            if not ok:
-                appended_failures.append(details)
-                print("Correctness checks failed; commencing next loop.", file=sys.stderr)
-            else:
-                print(f"Correctness checks: {details}", file=sys.stderr)
+            ok, details, checker_was_configured = run_correctness_checks(root)
 
+            # Spec: only loop once when there is no correctness checker.
+            if not checker_configured_for_loop:
+                print(f"Correctness checks: {details}", file=sys.stderr)
+                print("No correctness checker configured; single iteration complete.", file=sys.stderr)
+                return
+
+            # Spec: if five iterations take place and the model is still requesting changes,
+            # apply those changes and then break out, requesting human intervention.
             if iteration >= max_iterations:
                 print(
                     "Cycle limit reached (5 iterations) and model is still requesting changes. "
@@ -743,11 +1036,24 @@ def main() -> None:
                 )
                 return
 
-            # Continue loop (even if checks passed) until model converges.
+            if not ok:
+                appended_failures.append(details)
+                print("Correctness checks failed; commencing next loop.", file=sys.stderr)
+                continue
+
+            print(f"Correctness checks: {details}", file=sys.stderr)
+
+            # Spec: if there are no findings from the correctness checker after a change is applied,
+            # the loop ends.
+            if checker_was_configured:
+                print("No findings from correctness checker; ending loop.", file=sys.stderr)
+                return
+
+            # Defensive: checker_configured_for_loop should imply a checker is configured.
             continue
 
-        # No changes requested by the model: we are at convergence unless checks fail.
-        ok, details = run_correctness_checks(root)
+        # No changes requested by the model.
+        ok, details, _checker_was_configured = run_correctness_checks(root)
         if ok:
             print(f"Converged. Correctness checks: {details}", file=sys.stderr)
             return
