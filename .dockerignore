@@ -1,0 +1,7 @@
+.git
+.direnv
+.venv
+.claude
+__pycache__
+result
+.DS_Store
