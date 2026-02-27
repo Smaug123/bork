@@ -7,6 +7,9 @@ Notably:
 - Omits `.gitignore`'d files from the prompt.
 - Does not modify `.git/`.
 - Does not modify `.config/bork.json` (user configuration).
+- Requires per-change human approval for edits to `specs/`.
+- Requires per-change human approval for edits to any paths configured in `.config/bork.json`'s
+  `edits-require-approval` list, and for edits to the configured correctness checker executable.
 - Can run an optional correctness checker configured in `.config/bork.json`.
 """
 
@@ -532,7 +535,6 @@ def _pending_spec_changes_path(root: Path) -> Path:
 def _merge_pending_spec_changes(root: Path, pending: dict) -> None:
     """Persist pending spec changes for later manual review."""
     p = _pending_spec_changes_path(root)
-    p.parent.mkdir(parents=True, exist_ok=True)
 
     existing = {"create-or-update": {}, "delete": []}
     if p.exists():
@@ -547,10 +549,32 @@ def _merge_pending_spec_changes(root: Path, pending: dict) -> None:
 
     merged_delete = list(dict.fromkeys([*(existing.get("delete", []) or []), *(pending.get("delete", []) or [])]))
 
-    p.write_text(
-        json.dumps({"create-or-update": merged_create, "delete": merged_delete}, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    payload = json.dumps({"create-or-update": merged_create, "delete": merged_delete}, indent=2, sort_keys=True) + "\n"
+    safe_write_text_under_root(root, ".claude/pending_spec_changes.json", payload)
+
+
+def _pending_human_approval_changes_path(root: Path) -> Path:
+    return root / ".claude" / "pending_human_approval.json"
+
+
+def _merge_pending_human_approval_changes(root: Path, pending: dict) -> None:
+    """Persist pending non-spec changes which require human approval."""
+    p = _pending_human_approval_changes_path(root)
+
+    existing = {"create-or-update": {}, "delete": []}
+    if p.exists():
+        try:
+            existing = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            existing = {"create-or-update": {}, "delete": []}
+
+    merged_create = dict(existing.get("create-or-update", {}))
+    merged_create.update(pending.get("create-or-update", {}))
+
+    merged_delete = list(dict.fromkeys([*(existing.get("delete", []) or []), *(pending.get("delete", []) or [])]))
+
+    payload = json.dumps({"create-or-update": merged_create, "delete": merged_delete}, indent=2, sort_keys=True) + "\n"
+    safe_write_text_under_root(root, ".claude/pending_human_approval.json", payload)
 
 
 def _print_unified_diff(old: str, new: str, *, fromfile: str, tofile: str) -> None:
@@ -572,9 +596,125 @@ def _approve_spec_change(rel: str, *, action: str) -> bool:
     return ans.strip().lower() == "yes"
 
 
+def _approve_human_required_change(rel: str, *, action: str) -> bool:
+    """Request per-file human approval for non-spec changes that require approval."""
+    if not sys.stdin.isatty():
+        return False
+    prompt = f"Approve {action} to {rel}? Type 'yes' to approve: "
+    try:
+        ans = input(prompt)
+    except EOFError:
+        return False
+    return ans.strip().lower() == "yes"
+
+
 def _is_protected_path(rel: str) -> bool:
     # Paths are already traversal-checked and backslashes are rejected.
     return _normalize_rel_path(rel) in PROTECTED_REL_PATHS
+
+
+def _normalize_configured_repo_path(raw: object) -> str | None:
+    """Normalize a repo-relative path sourced from user config.
+
+    The config examples use a leading "./" (e.g. "./correctness.py"). We accept and strip
+    that prefix, while still rejecting absolute paths, backslashes, NUL bytes, and traversal
+    via "..". We also reject embedded "." path segments (e.g. "foo/./bar").
+
+    Returns a normalized posix relative path, or None if invalid.
+    """
+    if not isinstance(raw, str):
+        return None
+
+    s = raw.strip()
+    if not s:
+        return None
+
+    if "\x00" in s or "\\" in s:
+        return None
+
+    # Accept and strip one or more leading "./".
+    while s.startswith("./"):
+        s = s[2:]
+
+    if s in {"", "."}:
+        return None
+
+    p = PurePath(s)
+
+    if p.is_absolute() or getattr(p, "drive", ""):
+        return None
+
+    if any(part in {"..", "."} for part in p.parts):
+        return None
+
+    return p.as_posix()
+
+
+def _approval_requirements_from_config(root: Path) -> tuple[bool, set[str]]:
+    """Return (require_approval_for_all_edits, normalized_paths_requiring_approval)."""
+    cfg, err = _read_bork_config(root)
+
+    # If config exists but is invalid/unreadable, we conservatively require approval for all edits.
+    if err is not None:
+        print(f"Warning: {err}. Requiring human approval for all edits.", file=sys.stderr)
+        return True, set()
+
+    if cfg is None:
+        return False, set()
+
+    require_all = False
+    required: set[str] = set()
+
+    # edits-require-approval
+    era = cfg.get("edits-require-approval", [])
+    if era is None:
+        era = []
+    if not isinstance(era, list):
+        print(
+            f"Warning: {CONFIG_REL_PATH} field 'edits-require-approval' must be a list of strings. "
+            "Requiring human approval for all edits.",
+            file=sys.stderr,
+        )
+        require_all = True
+    else:
+        for item in era:
+            normalized = _normalize_configured_repo_path(item)
+            if normalized is None:
+                print(
+                    f"Warning: ignoring invalid entry in edits-require-approval: {item!r} (must be a safe repo-relative path)",
+                    file=sys.stderr,
+                )
+                continue
+            if normalized in PROTECTED_REL_PATHS:
+                # The config file itself is always immutable.
+                continue
+            required.add(normalized)
+
+    # correctness-checker executable requires approval if configured.
+    checker = cfg.get("correctness-checker")
+    if isinstance(checker, str) and checker.strip():
+        normalized = _normalize_configured_repo_path(checker)
+        if normalized is None:
+            # Don't force require_all for this; just warn.
+            print(
+                f"Warning: configured correctness-checker path is not a safe repo-relative path: {checker!r}. "
+                "Cannot enforce approval for that path.",
+                file=sys.stderr,
+            )
+        else:
+            if normalized not in PROTECTED_REL_PATHS:
+                required.add(normalized)
+
+    return require_all, required
+
+
+def _read_text_best_effort(p: Path) -> str:
+    try:
+        if p.exists() and p.is_file():
+            return p.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+    return ""
 
 
 def apply_changes(changes: dict, root: Path) -> None:
@@ -596,6 +736,13 @@ def apply_changes(changes: dict, root: Path) -> None:
             raise ValueError("delete entries must be strings")
         _reject_path_traversal(rel)
 
+    require_all_approval, approval_paths = _approval_requirements_from_config(root)
+
+    def _requires_human_approval(rel: str) -> bool:
+        if require_all_approval:
+            return True
+        return _normalize_rel_path(rel) in approval_paths
+
     # Split out spec changes for separate human approval.
     normal_create: dict[str, str] = {}
     spec_create: dict[str, str] = {}
@@ -613,6 +760,9 @@ def apply_changes(changes: dict, root: Path) -> None:
         else:
             normal_delete.append(rel)
 
+    # Pending buckets.
+    pending_human: dict = {"create-or-update": {}, "delete": []}
+
     # Apply non-spec changes.
     for rel, content in normal_create.items():
         parts = Path(rel).parts
@@ -621,6 +771,20 @@ def apply_changes(changes: dict, root: Path) -> None:
             continue
         if _is_protected_path(rel):
             print(f"  skipping protected config path: {rel}", file=sys.stderr)
+            continue
+
+        if _requires_human_approval(rel):
+            old_content = _read_text_best_effort(root / rel)
+            print(f"\n--- PROPOSED CHANGE (REQUIRES APPROVAL): {rel} ---", file=sys.stderr)
+            _print_unified_diff(old_content, content, fromfile=f"a/{rel}", tofile=f"b/{rel}")
+            print(f"--- END PROPOSED CHANGE: {rel} ---\n", file=sys.stderr)
+
+            if _approve_human_required_change(rel, action="update/create"):
+                safe_write_text_under_root(root, rel, content)
+                print(f"  wrote (approved): {rel}", file=sys.stderr)
+            else:
+                pending_human["create-or-update"][rel] = content
+                print(f"  pending (human approval required): {rel}", file=sys.stderr)
             continue
 
         safe_write_text_under_root(root, rel, content)
@@ -635,6 +799,24 @@ def apply_changes(changes: dict, root: Path) -> None:
             print(f"  skipping protected config path: {rel}", file=sys.stderr)
             continue
 
+        if _requires_human_approval(rel):
+            old_content = _read_text_best_effort(root / rel)
+            print(f"\n--- PROPOSED DELETE (REQUIRES APPROVAL): {rel} ---", file=sys.stderr)
+            _print_unified_diff(old_content, "", fromfile=f"a/{rel}", tofile=f"b/{rel}")
+            print(f"--- END PROPOSED DELETE: {rel} ---\n", file=sys.stderr)
+
+            if _approve_human_required_change(rel, action="delete"):
+                try:
+                    safe_delete_under_root(root, rel)
+                except IsADirectoryError:
+                    print(f"  skipping directory delete request (approved): {rel}", file=sys.stderr)
+                else:
+                    print(f"  deleted (approved): {rel}", file=sys.stderr)
+            else:
+                pending_human["delete"].append(rel)
+                print(f"  pending delete (human approval required): {rel}", file=sys.stderr)
+            continue
+
         try:
             safe_delete_under_root(root, rel)
         except IsADirectoryError:
@@ -643,8 +825,20 @@ def apply_changes(changes: dict, root: Path) -> None:
             continue
         print(f"  deleted: {rel}", file=sys.stderr)
 
+    if pending_human["create-or-update"] or pending_human["delete"]:
+        _merge_pending_human_approval_changes(root, pending_human)
+        print(
+            f"\nSome changes require human approval and were not applied. Pending changes written to: {Path('.claude') / 'pending_human_approval.json'}",
+            file=sys.stderr,
+        )
+        if not sys.stdin.isatty():
+            print(
+                "(Non-interactive stdin detected; approval-required changes were therefore deferred.)",
+                file=sys.stderr,
+            )
+
     # Handle spec changes with per-file approval.
-    pending: dict = {"create-or-update": {}, "delete": []}
+    pending_spec: dict = {"create-or-update": {}, "delete": []}
 
     for rel, new_content in spec_create.items():
         parts = Path(rel).parts
@@ -652,13 +846,7 @@ def apply_changes(changes: dict, root: Path) -> None:
             print(f"  skipping .git path: {rel}", file=sys.stderr)
             continue
 
-        old_content = ""
-        abs_path = root / rel
-        if abs_path.exists() and abs_path.is_file():
-            try:
-                old_content = abs_path.read_text(encoding="utf-8")
-            except Exception:
-                old_content = ""
+        old_content = _read_text_best_effort(root / rel)
 
         print(f"\n--- PROPOSED SPEC CHANGE: {rel} ---", file=sys.stderr)
         _print_unified_diff(old_content, new_content, fromfile=f"a/{rel}", tofile=f"b/{rel}")
@@ -668,7 +856,7 @@ def apply_changes(changes: dict, root: Path) -> None:
             safe_write_text_under_root(root, rel, new_content)
             print(f"  wrote (approved spec change): {rel}", file=sys.stderr)
         else:
-            pending["create-or-update"][rel] = new_content
+            pending_spec["create-or-update"][rel] = new_content
             print(f"  pending (spec change requires approval): {rel}", file=sys.stderr)
 
     for rel in spec_delete:
@@ -677,7 +865,11 @@ def apply_changes(changes: dict, root: Path) -> None:
             print(f"  skipping .git path: {rel}", file=sys.stderr)
             continue
 
+        old_content = _read_text_best_effort(root / rel)
         print(f"\n--- PROPOSED SPEC DELETE: {rel} ---", file=sys.stderr)
+        _print_unified_diff(old_content, "", fromfile=f"a/{rel}", tofile=f"b/{rel}")
+        print(f"--- END PROPOSED SPEC DELETE: {rel} ---\n", file=sys.stderr)
+
         if _approve_spec_change(rel, action="delete"):
             try:
                 safe_delete_under_root(root, rel)
@@ -686,11 +878,11 @@ def apply_changes(changes: dict, root: Path) -> None:
             else:
                 print(f"  deleted (approved spec change): {rel}", file=sys.stderr)
         else:
-            pending["delete"].append(rel)
+            pending_spec["delete"].append(rel)
             print(f"  pending (spec delete requires approval): {rel}", file=sys.stderr)
 
-    if pending["create-or-update"] or pending["delete"]:
-        _merge_pending_spec_changes(root, pending)
+    if pending_spec["create-or-update"] or pending_spec["delete"]:
+        _merge_pending_spec_changes(root, pending_spec)
         print(
             f"\nSpec changes were not fully applied. Pending changes written to: {Path('.claude') / 'pending_spec_changes.json'}",
             file=sys.stderr,
