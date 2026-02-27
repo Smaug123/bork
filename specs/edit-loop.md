@@ -16,6 +16,12 @@ The model is permitted to change the specs, but is strongly encouraged not to do
 If the `specs/` folder is locally different from how it appears on the `main` branch (including new unstaged files), that diff is also supplied to the LLM, to highlight that this particular reconciliation is probably a "task to be performed/verified".
 New unstaged files are not represented twice in the LLM input, but instead their filepath is indicated as being "newly added".
 
+# Prompt
+
+The actual prompt given to the LLM has the following properties:
+
+* It encourages the model not to assume that any given piece of code is currently correct. (This is because the changes to the spec may be heavily divergent from the code, and the reconciliation loop must help them converge.)
+
 # Output format
 
 The LLM returns JSON of this format, where the keys of the `create-or-update` object indicate what files should exist:

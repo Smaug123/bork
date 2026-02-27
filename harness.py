@@ -29,6 +29,10 @@ SKIP_DIRS = {".git", ".direnv", "__pycache__", ".claude"}
 CONFIG_REL_PATH = ".config/bork.json"
 PROTECTED_REL_PATHS = {CONFIG_REL_PATH}
 
+# Per specs/llm-api-usage.md
+LLM_MODEL = "gpt-5.3-codex"
+LLM_REASONING_EFFORT = "high"
+
 
 def _load_gitignore_patterns(root: Path) -> list[str]:
     """Load top-level .gitignore patterns if present.
@@ -296,6 +300,8 @@ def build_prompt(
         "including specification documents in specs/*.md.\n\n"
         "Your job: determine what changes are needed to bring the codebase into "
         "compliance with the specs.\n\n"
+        "Do not assume that any given piece of code is currently correct. "
+        "Treat the current codebase and the specs as potentially divergent, and reconcile them.\n\n"
         "Respond with ONLY a JSON object (no markdown fencing) with this exact schema:\n"
         '{"create-or-update": {"filepath": "file contents", ...}, "delete": ["filepath", ...]}\n\n'
         "If no changes are needed, return: "
@@ -1152,6 +1158,120 @@ def _wants_changes(changes: dict) -> bool:
     return bool(create_map) or bool(delete_list)
 
 
+def _extract_responses_api_output_text(response: object) -> str | None:
+    """Best-effort extraction of a text payload from the Responses API result."""
+
+    # Newer SDKs expose an aggregated string.
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str) and output_text.strip() != "":
+        return output_text
+
+    # Some SDKs return dict-like payloads.
+    if isinstance(response, dict):
+        ot = response.get("output_text")
+        if isinstance(ot, str) and ot.strip() != "":
+            return ot
+
+    # Try to stitch together content blocks.
+    out = getattr(response, "output", None)
+    if out is None and isinstance(response, dict):
+        out = response.get("output")
+
+    if not isinstance(out, list):
+        return None
+
+    texts: list[str] = []
+
+    for item in out:
+        content = None
+        if isinstance(item, dict):
+            content = item.get("content")
+        else:
+            content = getattr(item, "content", None)
+
+        if not isinstance(content, list):
+            continue
+
+        for block in content:
+            if isinstance(block, dict):
+                # Common shape: {"type": "output_text", "text": "..."}
+                t = block.get("text")
+                if isinstance(t, str):
+                    texts.append(t)
+                continue
+
+            t = getattr(block, "text", None)
+            if isinstance(t, str):
+                texts.append(t)
+
+    if not texts:
+        return None
+
+    return "".join(texts)
+
+
+def _invoke_llm_via_responses_api(client: OpenAI, prompt: str) -> str:
+    """Invoke the LLM using the OpenAI Responses API.
+
+    Per specs/llm-api-usage.md:
+      - model: gpt-5.3-codex
+      - reasoning: high
+      - timeout: configured on the client
+
+    We request a JSON object output format.
+
+    Note: Codex-family models are not chat models; they must use the Responses API.
+    """
+
+    # Try a small set of argument spellings for compatibility across SDK versions,
+    # while preserving the same required semantics.
+    attempts: list[dict] = [
+        {
+            "model": LLM_MODEL,
+            "input": prompt,
+            "reasoning": {"effort": LLM_REASONING_EFFORT},
+            "text": {"format": {"type": "json_object"}},
+        },
+        {
+            "model": LLM_MODEL,
+            "input": prompt,
+            "reasoning": {"effort": LLM_REASONING_EFFORT},
+            "response_format": {"type": "json_object"},
+        },
+        {
+            "model": LLM_MODEL,
+            "input": prompt,
+            "reasoning_effort": LLM_REASONING_EFFORT,
+            "text": {"format": {"type": "json_object"}},
+        },
+        {
+            "model": LLM_MODEL,
+            "input": prompt,
+            "reasoning_effort": LLM_REASONING_EFFORT,
+            "response_format": {"type": "json_object"},
+        },
+    ]
+
+    last_type_error: Exception | None = None
+
+    for kwargs in attempts:
+        try:
+            response = client.responses.create(**kwargs)
+            raw = _extract_responses_api_output_text(response)
+            if raw is None or raw.strip() == "":
+                raise ValueError("LLM returned empty output text")
+            return raw
+        except TypeError as e:
+            # Different OpenAI SDK versions may not accept some kwargs.
+            last_type_error = e
+            continue
+
+    raise TypeError(
+        "OpenAI Responses API invocation failed due to incompatible client library "
+        "(did not accept required arguments for reasoning effort and/or JSON formatting)."
+    ) from last_type_error
+
+
 def main() -> None:
     root = Path.cwd()
 
@@ -1161,7 +1281,7 @@ def main() -> None:
 
     appended_failures: list[str] = []
 
-    # Spec: use the most advanced model (currently gpt-5.2) with high reasoning,
+    # Spec: use the most advanced OpenAI model (currently gpt-5.3-codex) with high reasoning,
     # and a 1 hour timeout on requests.
     client = OpenAI(timeout=60 * 60)
 
@@ -1193,16 +1313,7 @@ def main() -> None:
 
         print(f"Collected {len(files)} files; iteration {iteration}/{max_iterations}; sending to LLM...", file=sys.stderr)
 
-        response = client.chat.completions.create(
-            model="gpt-5.2",
-            messages=[{"role": "user", "content": prompt}],
-            reasoning_effort="high",
-            response_format={"type": "json_object"},
-        )
-
-        raw = response.choices[0].message.content
-        if raw is None:
-            raise ValueError("LLM returned empty content")
+        raw = _invoke_llm_via_responses_api(client, prompt)
 
         changes = json.loads(raw)
 

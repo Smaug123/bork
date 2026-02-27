@@ -26,3 +26,5 @@ response = client.chat.completions.create(
     reasoning_effort="none"
 )
 ```
+
+The Codex family of models are not chat models, so must use the Responses API.
