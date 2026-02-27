@@ -24,11 +24,14 @@
           runtimeInputs = [ pkgs.claude-code ];
         };
 
+        # The harness imports `openai`, so ensure the dev env provides it.
+        python = pkgs.python3.withPackages (ps: [ ps.openai ]);
+
         devPackages = [
           pkgs.uv
           pkgs.codex
           claude
-          pkgs.python3
+          python
 
           # Also expose the underlying binary directly.
           pkgs.claude-code

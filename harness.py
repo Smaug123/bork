@@ -296,6 +296,8 @@ def build_prompt(
         "including specification documents in specs/*.md.\n\n"
         "Your job: determine what changes are needed to bring the codebase into "
         "compliance with the specs.\n\n"
+        "Do not assume that any given piece of code is currently correct. "
+        "Treat the current codebase and the specs as potentially divergent, and reconcile them.\n\n"
         "Respond with ONLY a JSON object (no markdown fencing) with this exact schema:\n"
         '{"create-or-update": {"filepath": "file contents", ...}, "delete": ["filepath", ...]}\n\n'
         "If no changes are needed, return: "
