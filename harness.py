@@ -31,7 +31,7 @@ PROTECTED_REL_PATHS = {CONFIG_REL_PATH}
 
 # Per specs/llm-api-usage.md
 LLM_MODEL = "gpt-5.3-codex"
-LLM_REASONING_EFFORT = "xhigh"
+LLM_REASONING_EFFORT = "high"
 
 
 def _load_gitignore_patterns(root: Path) -> list[str]:
@@ -1215,7 +1215,7 @@ def _invoke_llm_via_responses_api(client: OpenAI, prompt: str) -> str:
 
     Per specs/llm-api-usage.md:
       - model: gpt-5.3-codex
-      - reasoning: xhigh
+      - reasoning: high
       - timeout: configured on the client
 
     We request a JSON object output format.
@@ -1281,7 +1281,7 @@ def main() -> None:
 
     appended_failures: list[str] = []
 
-    # Spec: use the most advanced OpenAI model (currently gpt-5.3-codex) with xhigh reasoning,
+    # Spec: use the most advanced OpenAI model (currently gpt-5.3-codex) with high reasoning,
     # and a 1 hour timeout on requests.
     client = OpenAI(timeout=60 * 60)
 
