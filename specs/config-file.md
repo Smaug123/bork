@@ -31,11 +31,11 @@ This field's absence is semantically equivalent to setting it to an empty list.
 
 The harness also considers some files to be mutable but only after explicit human approval for each edit:
 
-* the correctness checker executable, if configured;
 * `specs/*` (although the glob syntax is not recognised, so `edits-require-approval` cannot express this constraint anyway).
 
 Note that the harness already considers some files to be totally immutable (which is stronger than the guarantee of `edits-require-approval`), so they also need not be specified in this list:
 
 * the Bork config file itself (`.config/bork.json`);
-* `.git/*`.
+* `.git/*`;
+* the correctness checker executable, if configured.
 

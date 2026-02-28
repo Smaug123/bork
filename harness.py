@@ -4,13 +4,14 @@
 Implements the reconciliation loop defined in specs/edit-loop.md.
 
 Notably:
-- Omits `.gitignore`'d files from the prompt.
+- Omits `.gitignore`'d files, `.git`, and the configured correctness checker from the prompt.
 - Does not modify `.git/`.
 - Does not modify `.config/bork.json` (user configuration).
+- Does not modify the configured correctness checker executable.
 - Prints attempted contents when the model tries to write forbidden paths.
 - Requires per-change human approval for edits to `specs/`.
 - Requires per-change human approval for edits to any paths configured in `.config/bork.json`'s
-  `edits-require-approval` list, and for edits to the configured correctness checker executable.
+  `edits-require-approval` list.
 - Can run an optional correctness checker configured in `.config/bork.json`.
 - Invokes the OpenAI Responses API in streaming mode.
 """
@@ -162,13 +163,16 @@ def _choose_main_ref(root: Path) -> str | None:
     return None
 
 
-def _collect_files_via_git(root: Path) -> dict[str, str] | None:
+def _collect_files_via_git(root: Path, *, excluded_paths: set[str] | None = None) -> dict[str, str] | None:
     """Collect files using git, respecting .gitignore via --exclude-standard.
 
     Returns None if git isn't available or we aren't in a git repo.
     """
     if not _in_git_repo(root):
         return None
+
+    excluded_paths = excluded_paths or set()
+    ignore_patterns = _load_gitignore_patterns(root)
 
     # Tracked files (cached) + untracked (others) excluding ignored.
     rc1, tracked, _ = _run_git_z(root, ["ls-files", "-z", "--cached"])
@@ -180,14 +184,20 @@ def _collect_files_via_git(root: Path) -> dict[str, str] | None:
 
     files: dict[str, str] = {}
     for rel in paths:
-        p = Path(rel)
+        rel_norm = PurePath(rel).as_posix()
+        p = Path(rel_norm)
         if any(part in SKIP_DIRS for part in p.parts):
             continue
+        if rel_norm in excluded_paths:
+            continue
+        if _is_ignored(rel_norm, ignore_patterns):
+            continue
+
         abs_path = root / p
         if not abs_path.is_file():
             continue
         try:
-            files[rel] = abs_path.read_text(encoding="utf-8")
+            files[rel_norm] = abs_path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, PermissionError, OSError):
             # Best-effort: omit binary/undecodable files.
             pass
@@ -195,8 +205,11 @@ def _collect_files_via_git(root: Path) -> dict[str, str] | None:
 
 
 def collect_files(root: Path) -> dict[str, str]:
-    """Collect all text files in the repo, omitting `.gitignore`'d files."""
-    git_files = _collect_files_via_git(root)
+    """Collect all text files in the repo, omitting `.gitignore`'d files and the configured correctness checker."""
+    checker_rel = _configured_correctness_checker_repo_path(root)
+    excluded_paths = {checker_rel} if checker_rel is not None else set()
+
+    git_files = _collect_files_via_git(root, excluded_paths=excluded_paths)
     if git_files is not None:
         return git_files
 
@@ -211,7 +224,9 @@ def collect_files(root: Path) -> dict[str, str]:
         if not path.is_file():
             continue
 
-        rel = str(rel_path)
+        rel = rel_path.as_posix()
+        if rel in excluded_paths:
+            continue
         if _is_ignored(rel, ignore_patterns):
             continue
 
@@ -633,9 +648,9 @@ def _approve_human_required_change(rel: str, *, action: str) -> bool:
     return ans.strip().lower() == "yes"
 
 
-def _is_protected_path(rel: str) -> bool:
+def _is_protected_path(rel: str, protected_paths: set[str]) -> bool:
     # Paths are already traversal-checked and backslashes are rejected.
-    return _normalize_rel_path(rel) in PROTECTED_REL_PATHS
+    return _normalize_rel_path(rel) in protected_paths
 
 
 def _normalize_configured_repo_path(raw: object) -> str | None:
@@ -673,6 +688,30 @@ def _normalize_configured_repo_path(raw: object) -> str | None:
         return None
 
     return p.as_posix()
+
+
+def _configured_correctness_checker_repo_path(root: Path) -> str | None:
+    """Return configured correctness checker path as a normalized repo-relative path, if valid."""
+    cfg, err = _read_bork_config(root)
+    if err is not None or cfg is None:
+        return None
+
+    checker = cfg.get("correctness-checker")
+    if checker is None:
+        return None
+
+    return _normalize_configured_repo_path(checker)
+
+
+def _protected_rel_paths(root: Path) -> set[str]:
+    """Return repo-relative paths that are immutable to LLM-proposed edits."""
+    protected = set(PROTECTED_REL_PATHS)
+
+    checker_rel = _configured_correctness_checker_repo_path(root)
+    if checker_rel is not None:
+        protected.add(checker_rel)
+
+    return protected
 
 
 def _approval_requirements_from_config(root: Path) -> tuple[bool, set[str]]:
@@ -714,21 +753,6 @@ def _approval_requirements_from_config(root: Path) -> tuple[bool, set[str]]:
                 # The config file itself is always immutable.
                 continue
             required.add(normalized)
-
-    # correctness-checker executable requires approval if configured.
-    checker = cfg.get("correctness-checker")
-    if isinstance(checker, str) and checker.strip():
-        normalized = _normalize_configured_repo_path(checker)
-        if normalized is None:
-            # Don't force require_all for this; just warn.
-            print(
-                f"Warning: configured correctness-checker path is not a safe repo-relative path: {checker!r}. "
-                "Cannot enforce approval for that path.",
-                file=sys.stderr,
-            )
-        else:
-            if normalized not in PROTECTED_REL_PATHS:
-                required.add(normalized)
 
     return require_all, required
 
@@ -779,6 +803,7 @@ def apply_changes(changes: dict, root: Path) -> None:
     create_map = validated_create
     delete_list = validated_delete
 
+    protected_paths = _protected_rel_paths(root)
     require_all_approval, approval_paths = _approval_requirements_from_config(root)
 
     def _requires_human_approval(rel: str) -> bool:
@@ -812,8 +837,12 @@ def apply_changes(changes: dict, root: Path) -> None:
         if parts and parts[0] == ".git":
             _print_refused_create_attempt(rel, content, reason="writes under .git are forbidden")
             continue
-        if _is_protected_path(rel):
-            _print_refused_create_attempt(rel, content, reason=f"writes to protected path are forbidden ({CONFIG_REL_PATH})")
+        if _is_protected_path(rel, protected_paths):
+            _print_refused_create_attempt(
+                rel,
+                content,
+                reason=f"writes to protected path are forbidden ({_normalize_rel_path(rel)})",
+            )
             continue
 
         if _requires_human_approval(rel):
@@ -838,8 +867,11 @@ def apply_changes(changes: dict, root: Path) -> None:
         if parts and parts[0] == ".git":
             _print_refused_delete_attempt(rel, reason="deletes under .git are forbidden")
             continue
-        if _is_protected_path(rel):
-            _print_refused_delete_attempt(rel, reason=f"deletes of protected path are forbidden ({CONFIG_REL_PATH})")
+        if _is_protected_path(rel, protected_paths):
+            _print_refused_delete_attempt(
+                rel,
+                reason=f"deletes of protected path are forbidden ({_normalize_rel_path(rel)})",
+            )
             continue
 
         if _requires_human_approval(rel):
@@ -1414,11 +1446,12 @@ def main() -> None:
         newly_added_specs = set(untracked_specs)
 
         files = collect_files(root)
+        protected_paths = sorted(_protected_rel_paths(root))
 
         appendix_parts: list[str] = [
             "--- HARNESS CONTEXT ---",
             f"Iteration: {iteration} / {max_iterations}",
-            f"Protected (never edited) path: {CONFIG_REL_PATH}",
+            f"Protected (never edited) paths: {', '.join(protected_paths)}",
             f"Correctness checker configured (controls loop mode): {checker_configured_for_loop}",
             "--- END HARNESS CONTEXT ---",
         ]

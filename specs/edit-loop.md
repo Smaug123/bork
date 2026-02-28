@@ -8,13 +8,15 @@ The Bork system runs a reconciliation loop until convergence or until a cycle li
 
 # Initial input format
 
-Codebases are small enough that we can simply concatenate the entire codebase (omitting `.gitignore`'d files), along with every spec, and have the LLM determine divergences from the spec within a single context window.
+Codebases are small enough that we can simply concatenate the entire codebase (omitting `.gitignore`'d files, the `.git` directory, and any configured [correctness checker](./correctness-checker.md)), along with every spec, and have the LLM determine divergences from the spec within a single context window.
 
 The coding harness does this concatenation using some reasonable mechanism to indicate the breaks between files, using filepaths to indicate what each file is, and it sends the request to the LLM to bring the codebase and specs into sync with each other.
 The model is permitted to change the specs, but is strongly encouraged not to do so.
 
 If the `specs/` folder is locally different from how it appears on the `main` branch (including new unstaged files), that diff is also supplied to the LLM, to highlight that this particular reconciliation is probably a "task to be performed/verified".
 New unstaged files are not represented twice in the LLM input, but instead their filepath is indicated as being "newly added".
+
+Rationale for preventing the LLM from reading the correctness checker: we wish the LLM to solve the problem rather than exploiting loopholes in the correctness oracle.
 
 # Prompt
 
@@ -45,6 +47,7 @@ The exceptions are:
 
 * the `.git` directory, which the harness never reads or writes, not even asking the user to approve changes;
 * the [`.config/bork.json` configuration file](./config-file.md) (which configures the harness, and again the harness will neither edit nor ask the user to approve changes to this file);
+* any correctness checker configured in the `.config/bork.json` config file, which the harness never reads or writes, not even asking the user to approve changes;
 * any attempts at filesystem traversal, including (for example) `../foo`, not even asking the user to approve changes;
 * changes to `specs/`, which can be made but require individual human approval for each change;
 * changes to any files configured in the configuration file's `edits-require-approval` list.
