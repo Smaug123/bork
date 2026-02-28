@@ -10,5 +10,5 @@
         ".dockerignore",
         "docker/Dockerfile"
     ],
-    "correctness-checker": "correctness-check.py"
+    "correctness-checker": "./correctness-check.py"
 }
