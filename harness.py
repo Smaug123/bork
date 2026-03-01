@@ -14,6 +14,7 @@ Notably:
   `edits-require-approval` list.
 - Can run an optional correctness checker configured in `.config/bork.json`.
 - Invokes the OpenAI Responses API in streaming mode.
+- Supports debug logging of LLM requests/responses via `BORK_ENABLE_DEBUG_LOG=1`.
 """
 
 import difflib
@@ -23,7 +24,9 @@ import os
 import stat
 import subprocess
 import sys
+from collections.abc import Iterable, Mapping
 from pathlib import Path, PurePath
+from typing import Any, TypedDict, cast
 
 from openai import OpenAI
 
@@ -35,6 +38,79 @@ PROTECTED_REL_PATHS = {CONFIG_REL_PATH}
 # Per specs/llm-api-usage.md
 LLM_MODEL = "gpt-5.3-codex"
 LLM_REASONING_EFFORT = "high"
+
+ChangeSet = TypedDict("ChangeSet", {"create-or-update": dict[str, str], "delete": list[str]})
+BorkConfig = dict[str, object]
+
+
+def _empty_change_set() -> ChangeSet:
+    return {"create-or-update": {}, "delete": []}
+
+
+def _dedupe_preserve_order(items: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _parse_change_set(raw: object) -> ChangeSet:
+    """Parse/validate a change-set JSON object.
+
+    Expected shape:
+      {
+        "create-or-update": {"path": "contents", ...},
+        "delete": ["path", ...]
+      }
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("LLM output must be a JSON object")
+
+    payload = cast(Mapping[str, object], raw)
+    create_raw = payload.get("create-or-update", {})
+    delete_raw = payload.get("delete", [])
+
+    if create_raw is None:
+        create_raw = {}
+    if delete_raw is None:
+        delete_raw = []
+
+    if not isinstance(create_raw, dict) or not isinstance(delete_raw, list):
+        raise ValueError("LLM output must include 'create-or-update' object and 'delete' list")
+
+    create_map: dict[str, str] = {}
+    for rel, content in cast(dict[object, object], create_raw).items():
+        if not isinstance(rel, str):
+            raise ValueError("create-or-update keys must be strings")
+        if not isinstance(content, str):
+            raise ValueError(f"file contents for {rel} must be a string")
+        create_map[rel] = content
+
+    delete_list: list[str] = []
+    for rel in cast(list[object], delete_raw):
+        if not isinstance(rel, str):
+            raise ValueError("delete entries must be strings")
+        delete_list.append(rel)
+
+    return {"create-or-update": create_map, "delete": delete_list}
+
+
+def _debug_log_enabled() -> bool:
+    return os.environ.get("BORK_ENABLE_DEBUG_LOG") == "1"
+
+
+def _debug_log_block(title: str, body: str) -> None:
+    if not _debug_log_enabled():
+        return
+    print(f"\n--- DEBUG: {title} ---", file=sys.stderr)
+    sys.stderr.write(body)
+    if not body.endswith("\n"):
+        sys.stderr.write("\n")
+    print(f"--- END DEBUG: {title} ---\n", file=sys.stderr)
 
 
 def _load_gitignore_patterns(root: Path) -> list[str]:
@@ -171,7 +247,7 @@ def _collect_files_via_git(root: Path, *, excluded_paths: set[str] | None = None
     if not _in_git_repo(root):
         return None
 
-    excluded_paths = excluded_paths or set()
+    excluded: set[str] = excluded_paths if excluded_paths is not None else set[str]()
     ignore_patterns = _load_gitignore_patterns(root)
 
     # Tracked files (cached) + untracked (others) excluding ignored.
@@ -188,7 +264,7 @@ def _collect_files_via_git(root: Path, *, excluded_paths: set[str] | None = None
         p = Path(rel_norm)
         if any(part in SKIP_DIRS for part in p.parts):
             continue
-        if rel_norm in excluded_paths:
+        if rel_norm in excluded:
             continue
         if _is_ignored(rel_norm, ignore_patterns):
             continue
@@ -207,7 +283,7 @@ def _collect_files_via_git(root: Path, *, excluded_paths: set[str] | None = None
 def collect_files(root: Path) -> dict[str, str]:
     """Collect all text files in the repo, omitting `.gitignore`'d files and the configured correctness checker."""
     checker_rel = _configured_correctness_checker_repo_path(root)
-    excluded_paths = {checker_rel} if checker_rel is not None else set()
+    excluded_paths: set[str] = {checker_rel} if checker_rel is not None else set[str]()
 
     git_files = _collect_files_via_git(root, excluded_paths=excluded_paths)
     if git_files is not None:
@@ -332,8 +408,6 @@ def build_prompt(
 
 def _reject_path_traversal(rel: str) -> None:
     """Reject paths that express traversal or are otherwise unsafe."""
-    if not isinstance(rel, str):
-        raise ValueError("path must be a string")
     if rel == "" or rel.strip() == "":
         raise ValueError("empty path rejected")
     if "\x00" in rel:
@@ -365,21 +439,8 @@ def _normalize_rel_path(rel: str) -> str:
 
 def _dir_fd_capable() -> bool:
     """Return True if this platform/Python supports *at() style operations via dir_fd."""
-    # We test whether os.open accepts the keyword-only dir_fd parameter.
-    # IMPORTANT: close the fd on success to avoid leaking descriptors.
-    try:
-        fd = os.open(".", os.O_RDONLY, dir_fd=None)  # type: ignore[arg-type]
-    except TypeError:
-        return False
-    except OSError:
-        # If this errors for reasons other than TypeError, dir_fd is likely supported.
-        return True
-    else:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        return True
+    required: tuple[Any, ...] = (os.open, os.mkdir, os.stat, os.unlink)
+    return all(func in os.supports_dir_fd for func in required)
 
 
 def _open_dir_no_symlink(name: str, *, dir_fd: int) -> int:
@@ -429,9 +490,6 @@ def _safe_walk_dirs(root: Path, dir_parts: tuple[str, ...], *, create_missing: b
 
 def safe_write_text_under_root(root: Path, rel: str, content: str) -> None:
     """Write a file under root while resisting traversal and symlink attacks."""
-    if not isinstance(content, str):
-        raise ValueError(f"file contents for {rel} must be a string")
-
     _reject_path_traversal(rel)
     parts = Path(rel).parts
     if not parts:
@@ -489,14 +547,8 @@ def safe_write_text_under_root(root: Path, rel: str, content: str) -> None:
         flags |= os.O_NOFOLLOW
 
     fd = os.open(str(target), flags, 0o644)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-            f.write(content)
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
 
 
 def safe_delete_under_root(root: Path, rel: str) -> None:
@@ -524,12 +576,8 @@ def safe_delete_under_root(root: Path, rel: str) -> None:
             if stat.S_ISDIR(st.st_mode):
                 raise IsADirectoryError(f"refusing to delete directory (files only): {rel}")
 
-            # Delete without following symlinks.
-            try:
-                os.unlink(filename, dir_fd=leaf_fd, follow_symlinks=False)
-            except TypeError:
-                # Very old Python/platform: no follow_symlinks.
-                os.unlink(filename, dir_fd=leaf_fd)
+            # Unlink removes the directory entry itself; it does not follow symlinks.
+            os.unlink(filename, dir_fd=leaf_fd)
             return
         finally:
             for fd in reversed(fds_to_close):
@@ -555,49 +603,51 @@ def _pending_spec_changes_path(root: Path) -> Path:
     return root / ".claude" / "pending_spec_changes.json"
 
 
-def _merge_pending_spec_changes(root: Path, pending: dict) -> None:
+def _merge_pending_spec_changes(root: Path, pending: ChangeSet) -> None:
     """Persist pending spec changes for later manual review."""
     p = _pending_spec_changes_path(root)
 
-    existing = {"create-or-update": {}, "delete": []}
+    existing = _empty_change_set()
     if p.exists():
         try:
-            existing = json.loads(p.read_text(encoding="utf-8"))
+            existing = _parse_change_set(json.loads(p.read_text(encoding="utf-8")))
         except Exception:
             # If unreadable/corrupt, overwrite.
-            existing = {"create-or-update": {}, "delete": []}
+            existing = _empty_change_set()
 
-    merged_create = dict(existing.get("create-or-update", {}))
-    merged_create.update(pending.get("create-or-update", {}))
+    merged_create = dict(existing["create-or-update"])
+    merged_create.update(pending["create-or-update"])
 
-    merged_delete = list(dict.fromkeys([*(existing.get("delete", []) or []), *(pending.get("delete", []) or [])]))
+    merged_delete = _dedupe_preserve_order([*existing["delete"], *pending["delete"]])
 
-    payload = json.dumps({"create-or-update": merged_create, "delete": merged_delete}, indent=2, sort_keys=True) + "\n"
-    safe_write_text_under_root(root, ".claude/pending_spec_changes.json", payload)
+    payload: ChangeSet = {"create-or-update": merged_create, "delete": merged_delete}
+    serialized = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    safe_write_text_under_root(root, ".claude/pending_spec_changes.json", serialized)
 
 
 def _pending_human_approval_changes_path(root: Path) -> Path:
     return root / ".claude" / "pending_human_approval.json"
 
 
-def _merge_pending_human_approval_changes(root: Path, pending: dict) -> None:
+def _merge_pending_human_approval_changes(root: Path, pending: ChangeSet) -> None:
     """Persist pending non-spec changes which require human approval."""
     p = _pending_human_approval_changes_path(root)
 
-    existing = {"create-or-update": {}, "delete": []}
+    existing = _empty_change_set()
     if p.exists():
         try:
-            existing = json.loads(p.read_text(encoding="utf-8"))
+            existing = _parse_change_set(json.loads(p.read_text(encoding="utf-8")))
         except Exception:
-            existing = {"create-or-update": {}, "delete": []}
+            existing = _empty_change_set()
 
-    merged_create = dict(existing.get("create-or-update", {}))
-    merged_create.update(pending.get("create-or-update", {}))
+    merged_create = dict(existing["create-or-update"])
+    merged_create.update(pending["create-or-update"])
 
-    merged_delete = list(dict.fromkeys([*(existing.get("delete", []) or []), *(pending.get("delete", []) or [])]))
+    merged_delete = _dedupe_preserve_order([*existing["delete"], *pending["delete"]])
 
-    payload = json.dumps({"create-or-update": merged_create, "delete": merged_delete}, indent=2, sort_keys=True) + "\n"
-    safe_write_text_under_root(root, ".claude/pending_human_approval.json", payload)
+    payload: ChangeSet = {"create-or-update": merged_create, "delete": merged_delete}
+    serialized = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    safe_write_text_under_root(root, ".claude/pending_human_approval.json", serialized)
 
 
 def _print_unified_diff(old: str, new: str, *, fromfile: str, tofile: str) -> None:
@@ -730,10 +780,11 @@ def _approval_requirements_from_config(root: Path) -> tuple[bool, set[str]]:
     required: set[str] = set()
 
     # edits-require-approval
-    era = cfg.get("edits-require-approval", [])
-    if era is None:
-        era = []
-    if not isinstance(era, list):
+    era_obj: object = cfg.get("edits-require-approval", [])
+    if era_obj is None:
+        era_obj = []
+
+    if not isinstance(era_obj, list):
         print(
             f"Warning: {CONFIG_REL_PATH} field 'edits-require-approval' must be a list of strings. "
             "Requiring human approval for all edits.",
@@ -741,7 +792,7 @@ def _approval_requirements_from_config(root: Path) -> tuple[bool, set[str]]:
         )
         require_all = True
     else:
-        for item in era:
+        for item in era_obj:
             normalized = _normalize_configured_repo_path(item)
             if normalized is None:
                 print(
@@ -766,22 +817,15 @@ def _read_text_best_effort(p: Path) -> str:
     return ""
 
 
-def apply_changes(changes: dict, root: Path) -> None:
+def apply_changes(changes: ChangeSet, root: Path) -> None:
     """Apply create-or-update and delete operations."""
 
-    create_map: dict[str, str] = changes.get("create-or-update", {}) or {}
-    delete_list: list[str] = changes.get("delete", []) or []
+    create_map: dict[str, str] = dict(changes["create-or-update"])
+    delete_list: list[str] = list(changes["delete"])
 
-    if not isinstance(create_map, dict) or not isinstance(delete_list, list):
-        raise ValueError("LLM output must include 'create-or-update' object and 'delete' list")
-
-    # Validate shapes and filter out unsafe paths.
+    # Validate and filter out unsafe paths.
     validated_create: dict[str, str] = {}
     for rel, content in create_map.items():
-        if not isinstance(rel, str):
-            raise ValueError("create-or-update keys must be strings")
-        if not isinstance(content, str):
-            raise ValueError(f"file contents for {rel} must be a string")
         try:
             _reject_path_traversal(rel)
         except ValueError as e:
@@ -791,8 +835,6 @@ def apply_changes(changes: dict, root: Path) -> None:
 
     validated_delete: list[str] = []
     for rel in delete_list:
-        if not isinstance(rel, str):
-            raise ValueError("delete entries must be strings")
         try:
             _reject_path_traversal(rel)
         except ValueError as e:
@@ -829,7 +871,7 @@ def apply_changes(changes: dict, root: Path) -> None:
             normal_delete.append(rel)
 
     # Pending buckets.
-    pending_human: dict = {"create-or-update": {}, "delete": []}
+    pending_human: ChangeSet = _empty_change_set()
 
     # Apply non-spec changes.
     for rel, content in normal_create.items():
@@ -913,7 +955,7 @@ def apply_changes(changes: dict, root: Path) -> None:
             )
 
     # Handle spec changes with per-file approval.
-    pending_spec: dict = {"create-or-update": {}, "delete": []}
+    pending_spec: ChangeSet = _empty_change_set()
 
     for rel, new_content in spec_create.items():
         parts = Path(rel).parts
@@ -969,7 +1011,7 @@ def apply_changes(changes: dict, root: Path) -> None:
             )
 
 
-def _read_bork_config(root: Path) -> tuple[dict | None, str | None]:
+def _read_bork_config(root: Path) -> tuple[BorkConfig | None, str | None]:
     """Read `.config/bork.json` if present.
 
     Returns: (config_dict_or_none, error_string_or_none)
@@ -984,13 +1026,14 @@ def _read_bork_config(root: Path) -> tuple[dict | None, str | None]:
         return None, f"failed to read {CONFIG_REL_PATH}: {e}"
 
     try:
-        data = json.loads(raw)
+        data_raw = json.loads(raw)
     except Exception as e:
         return None, f"invalid JSON in {CONFIG_REL_PATH}: {e}"
 
-    if not isinstance(data, dict):
+    if not isinstance(data_raw, dict):
         return None, f"{CONFIG_REL_PATH} must contain a JSON object"
 
+    data = cast(BorkConfig, data_raw)
     return data, None
 
 
@@ -1009,12 +1052,14 @@ def _correctness_checker_configured_for_loop(root: Path) -> bool:
 
     try:
         raw = cfg_path.read_text(encoding="utf-8")
-        data = json.loads(raw)
+        data_raw = json.loads(raw)
     except Exception:
         return True
 
-    if not isinstance(data, dict):
+    if not isinstance(data_raw, dict):
         return True
+
+    data = cast(Mapping[str, object], data_raw)
 
     if "correctness-checker" not in data:
         return False
@@ -1033,7 +1078,7 @@ def _decode_utf8_or_placeholder(b: bytes) -> str:
         return "<non-UTF8 output>"
 
 
-def _format_block_for_prompt(title: str, payload: dict) -> str:
+def _format_block_for_prompt(title: str, payload: Mapping[str, object]) -> str:
     return "\n".join(
         [
             f"--- {title} ---",
@@ -1053,8 +1098,8 @@ def _run_correctness_checker(root: Path, checker_cmd: str) -> tuple[bool, str]:
       - exit 2: failed to run
       - stdout: JSON
     """
-    if not isinstance(checker_cmd, str) or checker_cmd.strip() == "":
-        payload = {
+    if checker_cmd.strip() == "":
+        payload: dict[str, object] = {
             "checker": checker_cmd,
             "assessment": "failed-to-run",
             "summary": "Invalid correctness-checker value (must be a non-empty string).",
@@ -1101,7 +1146,7 @@ def _run_correctness_checker(root: Path, checker_cmd: str) -> tuple[bool, str]:
     stderr = _decode_utf8_or_placeholder(proc.stderr)
     exit_code = proc.returncode
 
-    parsed: object | None = None
+    parsed_raw: object | None = None
     parse_error: str | None = None
 
     # Spec requires JSON on stdout; treat missing/invalid JSON as a contract violation.
@@ -1112,24 +1157,28 @@ def _run_correctness_checker(root: Path, checker_cmd: str) -> tuple[bool, str]:
             parse_error = "stdout was empty; expected JSON"
         else:
             try:
-                parsed = json.loads(stdout)
+                parsed_raw = json.loads(stdout)
             except Exception as e:
                 parse_error = f"stdout was not valid JSON: {e}"
 
-    if parse_error is None and not isinstance(parsed, dict):
-        parse_error = f"stdout JSON was not an object (got {type(parsed).__name__})"
+    parsed: dict[str, object] | None = None
+    if parse_error is None:
+        if isinstance(parsed_raw, dict):
+            parsed = cast(dict[str, object], parsed_raw)
+        else:
+            parse_error = f"stdout JSON was not an object (got {type(parsed_raw).__name__})"
 
-    per_file_findings = None
-    overall_findings = None
-    if isinstance(parsed, dict):
-        per_file_findings = parsed.get("per_file_findings")
-        overall_findings = parsed.get("overall_findings")
+    per_file_findings_obj: object | None = None
+    overall_findings_obj: object | None = None
+    if parsed is not None:
+        per_file_findings_obj = parsed.get("per_file_findings")
+        overall_findings_obj = parsed.get("overall_findings")
 
     findings_count = 0
-    if isinstance(per_file_findings, list):
-        findings_count += len(per_file_findings)
-    if isinstance(overall_findings, list):
-        findings_count += len(overall_findings)
+    if isinstance(per_file_findings_obj, list):
+        findings_count += len(per_file_findings_obj)
+    if isinstance(overall_findings_obj, list):
+        findings_count += len(overall_findings_obj)
 
     assessment = "unexpected"
     ok = False
@@ -1155,17 +1204,17 @@ def _run_correctness_checker(root: Path, checker_cmd: str) -> tuple[bool, str]:
         assessment = "unexpected-exit-code"
         ok = False
 
-    payload: dict = {
+    payload: dict[str, object] = {
         "checker": checker_cmd,
         "exit-code": exit_code,
         "assessment": assessment,
         "stdout": stdout,
         "stderr": stderr,
-        "parsed": parsed if isinstance(parsed, dict) else None,
+        "parsed": parsed,
     }
     if parse_error is not None:
         payload["parse-error"] = parse_error
-    if isinstance(per_file_findings, list) or isinstance(overall_findings, list):
+    if isinstance(per_file_findings_obj, list) or isinstance(overall_findings_obj, list):
         payload["findings-count"] = findings_count
 
     if ok:
@@ -1192,7 +1241,7 @@ def run_correctness_checks(root: Path) -> tuple[bool, str, bool]:
     """
     cfg, err = _read_bork_config(root)
     if err is not None:
-        payload = {
+        payload: dict[str, object] = {
             "config": CONFIG_REL_PATH,
             "assessment": "failed-to-run",
             "summary": err,
@@ -1219,15 +1268,11 @@ def run_correctness_checks(root: Path) -> tuple[bool, str, bool]:
     return ok, details, True
 
 
-def _wants_changes(changes: dict) -> bool:
-    create_map = changes.get("create-or-update", {}) or {}
-    delete_list = changes.get("delete", []) or []
-    if not isinstance(create_map, dict) or not isinstance(delete_list, list):
-        raise ValueError("LLM output must include 'create-or-update' object and 'delete' list")
-    return bool(create_map) or bool(delete_list)
+def _wants_changes(changes: ChangeSet) -> bool:
+    return bool(changes["create-or-update"]) or bool(changes["delete"])
 
 
-def _extract_responses_api_output_text(response: object) -> str | None:
+def _extract_responses_api_output_text(response: Any) -> str | None:
     """Best-effort extraction of a text payload from the Responses API result."""
 
     # Newer SDKs expose an aggregated string.
@@ -1252,7 +1297,7 @@ def _extract_responses_api_output_text(response: object) -> str | None:
     texts: list[str] = []
 
     for item in out:
-        content = None
+        content: Any = None
         if isinstance(item, dict):
             content = item.get("content")
         else:
@@ -1269,9 +1314,9 @@ def _extract_responses_api_output_text(response: object) -> str | None:
                     texts.append(t)
                 continue
 
-            t = getattr(block, "text", None)
-            if isinstance(t, str):
-                texts.append(t)
+            t2 = getattr(block, "text", None)
+            if isinstance(t2, str):
+                texts.append(t2)
 
     if not texts:
         return None
@@ -1279,7 +1324,7 @@ def _extract_responses_api_output_text(response: object) -> str | None:
     return "".join(texts)
 
 
-def _extract_stream_event_text_delta(event: object) -> str | None:
+def _extract_stream_event_text_delta(event: Any) -> str | None:
     """Extract output-text delta payload from a streaming Responses API event."""
     if isinstance(event, dict):
         event_type = event.get("type")
@@ -1311,21 +1356,24 @@ def _extract_stream_event_text_delta(event: object) -> str | None:
     return None
 
 
-def _extract_stream_event_response(event: object) -> object | None:
+def _extract_stream_event_response(event: Any) -> Any | None:
     """Best-effort extraction of a final response object from a stream event."""
     if isinstance(event, dict):
         return event.get("response")
     return getattr(event, "response", None)
 
 
-def _invoke_llm_streaming_attempt(client: OpenAI, kwargs: dict) -> str:
+def _invoke_llm_streaming_attempt(client: OpenAI, kwargs: Mapping[str, object]) -> str:
     """Invoke Responses API in streaming mode and return concatenated output text."""
     chunks: list[str] = []
-    final_response: object | None = None
+    final_response: Any | None = None
 
-    stream_callable = getattr(client.responses, "stream", None)
+    responses_api: Any = client.responses
+    stream_callable: Any = getattr(responses_api, "stream", None)
+
     if callable(stream_callable):
-        with stream_callable(**kwargs) as stream:
+        stream_cm: Any = stream_callable(**kwargs)
+        with stream_cm as stream:
             for event in stream:
                 delta = _extract_stream_event_text_delta(event)
                 if isinstance(delta, str) and delta:
@@ -1341,7 +1389,7 @@ def _invoke_llm_streaming_attempt(client: OpenAI, kwargs: dict) -> str:
                 except Exception:
                     final_response = None
     else:
-        response_stream = client.responses.create(stream=True, **kwargs)
+        response_stream: Any = responses_api.create(stream=True, **kwargs)
         for event in response_stream:
             delta = _extract_stream_event_text_delta(event)
             if isinstance(delta, str) and delta:
@@ -1385,7 +1433,7 @@ def _invoke_llm_via_responses_api(client: OpenAI, prompt: str) -> str:
 
     # Try a small set of argument spellings for compatibility across SDK versions,
     # while preserving the same required semantics.
-    attempts: list[dict] = [
+    attempts: list[dict[str, object]] = [
         {
             "model": LLM_MODEL,
             "input": prompt,
@@ -1469,10 +1517,12 @@ def main() -> None:
         )
 
         print(f"Collected {len(files)} files; iteration {iteration}/{max_iterations}; sending to LLM...", file=sys.stderr)
+        _debug_log_block("LLM REQUEST", prompt)
 
         raw = _invoke_llm_via_responses_api(client, prompt)
+        _debug_log_block("LLM RESPONSE", raw)
 
-        changes = json.loads(raw)
+        changes = _parse_change_set(json.loads(raw))
 
         if _wants_changes(changes):
             print("Applying changes...", file=sys.stderr)
