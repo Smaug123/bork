@@ -8,7 +8,10 @@
         "scripts/devshell-smoke-test.sh",
         "scripts/docker-warmup.sh",
         ".dockerignore",
-        "docker/Dockerfile"
+        "docker/Dockerfile",
+        "uv.lock",
+        "pyproject.toml",
+        "pyrightconfig.json"
     ],
     "correctness-checker": "./correctness-check.py"
 }

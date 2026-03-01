@@ -1,0 +1,8 @@
+[project]
+name = "llm-take-the-wheel"
+version = "0.0.0"
+requires-python = ">=3.13"
+dependencies = ["openai"]
+
+[dependency-groups]
+dev = ["pyright"]

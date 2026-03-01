@@ -30,6 +30,10 @@
         devPackages = [
           pkgs.uv
           pkgs.codex
+
+          # Keep pyright reliable by providing a system Node.js in the devShell.
+          pkgs.nodejs
+
           claude
           python
 
