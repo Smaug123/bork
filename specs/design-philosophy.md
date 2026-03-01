@@ -1,6 +1,6 @@
 ---
 kind: spec
-id: core/correctness-checker
+id: core/design-philosophy
 description: The design philosophy of the software engineer that creates Bork.
 ---
 

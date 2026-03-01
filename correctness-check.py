@@ -22,8 +22,6 @@ def _decode_or_placeholder(raw: bytes) -> str:
 
 
 def main() -> None:
-    # Ensure the venv is populated with dev dependencies (e.g. openai)
-    # so Pyright can resolve imports.
     try:
         subprocess.run(["uv", "sync"], capture_output=True, check=True)
     except Exception as e:

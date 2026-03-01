@@ -10,7 +10,8 @@
         ".dockerignore",
         "docker/Dockerfile",
         "uv.lock",
-        "pyproject.toml"
+        "pyproject.toml",
+        "pyrightconfig.json"
     ],
     "correctness-checker": "./correctness-check.py"
 }
