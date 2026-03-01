@@ -2,6 +2,13 @@
     "edits-require-approval": [
         "flake.nix",
         "flake.lock",
-        ".envrc"
-    ]
+        ".envrc",
+        "scripts/bork-sandbox-build.sh",
+        "scripts/bork-sandbox-shell.sh",
+        "scripts/devshell-smoke-test.sh",
+        "scripts/docker-warmup.sh",
+        ".dockerignore",
+        "docker/Dockerfile"
+    ],
+    "correctness-checker": "./correctness-check.py"
 }

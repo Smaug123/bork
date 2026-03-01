@@ -4,13 +4,16 @@
 Implements the reconciliation loop defined in specs/edit-loop.md.
 
 Notably:
-- Omits `.gitignore`'d files from the prompt.
+- Omits `.gitignore`'d files, `.git`, and the configured correctness checker from the prompt.
 - Does not modify `.git/`.
 - Does not modify `.config/bork.json` (user configuration).
+- Does not modify the configured correctness checker executable.
+- Prints attempted contents when the model tries to write forbidden paths.
 - Requires per-change human approval for edits to `specs/`.
 - Requires per-change human approval for edits to any paths configured in `.config/bork.json`'s
-  `edits-require-approval` list, and for edits to the configured correctness checker executable.
+  `edits-require-approval` list.
 - Can run an optional correctness checker configured in `.config/bork.json`.
+- Invokes the OpenAI Responses API in streaming mode.
 """
 
 import difflib
@@ -160,13 +163,16 @@ def _choose_main_ref(root: Path) -> str | None:
     return None
 
 
-def _collect_files_via_git(root: Path) -> dict[str, str] | None:
+def _collect_files_via_git(root: Path, *, excluded_paths: set[str] | None = None) -> dict[str, str] | None:
     """Collect files using git, respecting .gitignore via --exclude-standard.
 
     Returns None if git isn't available or we aren't in a git repo.
     """
     if not _in_git_repo(root):
         return None
+
+    excluded_paths = excluded_paths or set()
+    ignore_patterns = _load_gitignore_patterns(root)
 
     # Tracked files (cached) + untracked (others) excluding ignored.
     rc1, tracked, _ = _run_git_z(root, ["ls-files", "-z", "--cached"])
@@ -178,14 +184,20 @@ def _collect_files_via_git(root: Path) -> dict[str, str] | None:
 
     files: dict[str, str] = {}
     for rel in paths:
-        p = Path(rel)
+        rel_norm = PurePath(rel).as_posix()
+        p = Path(rel_norm)
         if any(part in SKIP_DIRS for part in p.parts):
             continue
+        if rel_norm in excluded_paths:
+            continue
+        if _is_ignored(rel_norm, ignore_patterns):
+            continue
+
         abs_path = root / p
         if not abs_path.is_file():
             continue
         try:
-            files[rel] = abs_path.read_text(encoding="utf-8")
+            files[rel_norm] = abs_path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, PermissionError, OSError):
             # Best-effort: omit binary/undecodable files.
             pass
@@ -193,8 +205,11 @@ def _collect_files_via_git(root: Path) -> dict[str, str] | None:
 
 
 def collect_files(root: Path) -> dict[str, str]:
-    """Collect all text files in the repo, omitting `.gitignore`'d files."""
-    git_files = _collect_files_via_git(root)
+    """Collect all text files in the repo, omitting `.gitignore`'d files and the configured correctness checker."""
+    checker_rel = _configured_correctness_checker_repo_path(root)
+    excluded_paths = {checker_rel} if checker_rel is not None else set()
+
+    git_files = _collect_files_via_git(root, excluded_paths=excluded_paths)
     if git_files is not None:
         return git_files
 
@@ -209,7 +224,9 @@ def collect_files(root: Path) -> dict[str, str]:
         if not path.is_file():
             continue
 
-        rel = str(rel_path)
+        rel = rel_path.as_posix()
+        if rel in excluded_paths:
+            continue
         if _is_ignored(rel, ignore_patterns):
             continue
 
@@ -590,6 +607,23 @@ def _print_unified_diff(old: str, new: str, *, fromfile: str, tofile: str) -> No
     sys.stderr.writelines(diff)
 
 
+def _print_refused_create_attempt(rel: str, content: str, *, reason: str) -> None:
+    print(f"\n--- REFUSED CHANGE: {rel} ---", file=sys.stderr)
+    print(f"Reason: {reason}", file=sys.stderr)
+    print("--- ATTEMPTED CONTENTS ---", file=sys.stderr)
+    sys.stderr.write(content)
+    if not content.endswith("\n"):
+        sys.stderr.write("\n")
+    print("--- END ATTEMPTED CONTENTS ---", file=sys.stderr)
+    print(f"--- END REFUSED CHANGE: {rel} ---\n", file=sys.stderr)
+
+
+def _print_refused_delete_attempt(rel: str, *, reason: str) -> None:
+    print(f"\n--- REFUSED DELETE: {rel} ---", file=sys.stderr)
+    print(f"Reason: {reason}", file=sys.stderr)
+    print(f"--- END REFUSED DELETE: {rel} ---\n", file=sys.stderr)
+
+
 def _approve_spec_change(rel: str, *, action: str) -> bool:
     """Request per-file human approval for spec changes."""
     if not sys.stdin.isatty():
@@ -614,9 +648,9 @@ def _approve_human_required_change(rel: str, *, action: str) -> bool:
     return ans.strip().lower() == "yes"
 
 
-def _is_protected_path(rel: str) -> bool:
+def _is_protected_path(rel: str, protected_paths: set[str]) -> bool:
     # Paths are already traversal-checked and backslashes are rejected.
-    return _normalize_rel_path(rel) in PROTECTED_REL_PATHS
+    return _normalize_rel_path(rel) in protected_paths
 
 
 def _normalize_configured_repo_path(raw: object) -> str | None:
@@ -654,6 +688,30 @@ def _normalize_configured_repo_path(raw: object) -> str | None:
         return None
 
     return p.as_posix()
+
+
+def _configured_correctness_checker_repo_path(root: Path) -> str | None:
+    """Return configured correctness checker path as a normalized repo-relative path, if valid."""
+    cfg, err = _read_bork_config(root)
+    if err is not None or cfg is None:
+        return None
+
+    checker = cfg.get("correctness-checker")
+    if checker is None:
+        return None
+
+    return _normalize_configured_repo_path(checker)
+
+
+def _protected_rel_paths(root: Path) -> set[str]:
+    """Return repo-relative paths that are immutable to LLM-proposed edits."""
+    protected = set(PROTECTED_REL_PATHS)
+
+    checker_rel = _configured_correctness_checker_repo_path(root)
+    if checker_rel is not None:
+        protected.add(checker_rel)
+
+    return protected
 
 
 def _approval_requirements_from_config(root: Path) -> tuple[bool, set[str]]:
@@ -696,21 +754,6 @@ def _approval_requirements_from_config(root: Path) -> tuple[bool, set[str]]:
                 continue
             required.add(normalized)
 
-    # correctness-checker executable requires approval if configured.
-    checker = cfg.get("correctness-checker")
-    if isinstance(checker, str) and checker.strip():
-        normalized = _normalize_configured_repo_path(checker)
-        if normalized is None:
-            # Don't force require_all for this; just warn.
-            print(
-                f"Warning: configured correctness-checker path is not a safe repo-relative path: {checker!r}. "
-                "Cannot enforce approval for that path.",
-                file=sys.stderr,
-            )
-        else:
-            if normalized not in PROTECTED_REL_PATHS:
-                required.add(normalized)
-
     return require_all, required
 
 
@@ -732,16 +775,35 @@ def apply_changes(changes: dict, root: Path) -> None:
     if not isinstance(create_map, dict) or not isinstance(delete_list, list):
         raise ValueError("LLM output must include 'create-or-update' object and 'delete' list")
 
-    # Validate paths up-front (including spec paths), so we never persist/act on traversal.
-    for rel in create_map.keys():
+    # Validate shapes and filter out unsafe paths.
+    validated_create: dict[str, str] = {}
+    for rel, content in create_map.items():
         if not isinstance(rel, str):
             raise ValueError("create-or-update keys must be strings")
-        _reject_path_traversal(rel)
+        if not isinstance(content, str):
+            raise ValueError(f"file contents for {rel} must be a string")
+        try:
+            _reject_path_traversal(rel)
+        except ValueError as e:
+            _print_refused_create_attempt(rel, content, reason=f"unsafe path rejected: {e}")
+            continue
+        validated_create[rel] = content
+
+    validated_delete: list[str] = []
     for rel in delete_list:
         if not isinstance(rel, str):
             raise ValueError("delete entries must be strings")
-        _reject_path_traversal(rel)
+        try:
+            _reject_path_traversal(rel)
+        except ValueError as e:
+            _print_refused_delete_attempt(rel, reason=f"unsafe path rejected: {e}")
+            continue
+        validated_delete.append(rel)
 
+    create_map = validated_create
+    delete_list = validated_delete
+
+    protected_paths = _protected_rel_paths(root)
     require_all_approval, approval_paths = _approval_requirements_from_config(root)
 
     def _requires_human_approval(rel: str) -> bool:
@@ -773,10 +835,14 @@ def apply_changes(changes: dict, root: Path) -> None:
     for rel, content in normal_create.items():
         parts = Path(rel).parts
         if parts and parts[0] == ".git":
-            print(f"  skipping .git path: {rel}", file=sys.stderr)
+            _print_refused_create_attempt(rel, content, reason="writes under .git are forbidden")
             continue
-        if _is_protected_path(rel):
-            print(f"  skipping protected config path: {rel}", file=sys.stderr)
+        if _is_protected_path(rel, protected_paths):
+            _print_refused_create_attempt(
+                rel,
+                content,
+                reason=f"writes to protected path are forbidden ({_normalize_rel_path(rel)})",
+            )
             continue
 
         if _requires_human_approval(rel):
@@ -799,10 +865,13 @@ def apply_changes(changes: dict, root: Path) -> None:
     for rel in normal_delete:
         parts = Path(rel).parts
         if parts and parts[0] == ".git":
-            print(f"  skipping .git path: {rel}", file=sys.stderr)
+            _print_refused_delete_attempt(rel, reason="deletes under .git are forbidden")
             continue
-        if _is_protected_path(rel):
-            print(f"  skipping protected config path: {rel}", file=sys.stderr)
+        if _is_protected_path(rel, protected_paths):
+            _print_refused_delete_attempt(
+                rel,
+                reason=f"deletes of protected path are forbidden ({_normalize_rel_path(rel)})",
+            )
             continue
 
         if _requires_human_approval(rel):
@@ -849,7 +918,7 @@ def apply_changes(changes: dict, root: Path) -> None:
     for rel, new_content in spec_create.items():
         parts = Path(rel).parts
         if parts and parts[0] == ".git":
-            print(f"  skipping .git path: {rel}", file=sys.stderr)
+            _print_refused_create_attempt(rel, new_content, reason="writes under .git are forbidden")
             continue
 
         old_content = _read_text_best_effort(root / rel)
@@ -868,7 +937,7 @@ def apply_changes(changes: dict, root: Path) -> None:
     for rel in spec_delete:
         parts = Path(rel).parts
         if parts and parts[0] == ".git":
-            print(f"  skipping .git path: {rel}", file=sys.stderr)
+            _print_refused_delete_attempt(rel, reason="deletes under .git are forbidden")
             continue
 
         old_content = _read_text_best_effort(root / rel)
@@ -1210,6 +1279,96 @@ def _extract_responses_api_output_text(response: object) -> str | None:
     return "".join(texts)
 
 
+def _extract_stream_event_text_delta(event: object) -> str | None:
+    """Extract output-text delta payload from a streaming Responses API event."""
+    if isinstance(event, dict):
+        event_type = event.get("type")
+        delta = event.get("delta")
+        text = event.get("text")
+    else:
+        event_type = getattr(event, "type", None)
+        delta = getattr(event, "delta", None)
+        text = getattr(event, "text", None)
+
+    if not (isinstance(event_type, str) and "output_text" in event_type and "delta" in event_type):
+        return None
+
+    if isinstance(delta, str):
+        return delta
+
+    if isinstance(delta, dict):
+        t = delta.get("text")
+        if isinstance(t, str):
+            return t
+
+    t2 = getattr(delta, "text", None)
+    if isinstance(t2, str):
+        return t2
+
+    if isinstance(text, str):
+        return text
+
+    return None
+
+
+def _extract_stream_event_response(event: object) -> object | None:
+    """Best-effort extraction of a final response object from a stream event."""
+    if isinstance(event, dict):
+        return event.get("response")
+    return getattr(event, "response", None)
+
+
+def _invoke_llm_streaming_attempt(client: OpenAI, kwargs: dict) -> str:
+    """Invoke Responses API in streaming mode and return concatenated output text."""
+    chunks: list[str] = []
+    final_response: object | None = None
+
+    stream_callable = getattr(client.responses, "stream", None)
+    if callable(stream_callable):
+        with stream_callable(**kwargs) as stream:
+            for event in stream:
+                delta = _extract_stream_event_text_delta(event)
+                if isinstance(delta, str) and delta:
+                    chunks.append(delta)
+
+                maybe_response = _extract_stream_event_response(event)
+                if maybe_response is not None:
+                    final_response = maybe_response
+
+            if final_response is None and hasattr(stream, "get_final_response"):
+                try:
+                    final_response = stream.get_final_response()
+                except Exception:
+                    final_response = None
+    else:
+        response_stream = client.responses.create(stream=True, **kwargs)
+        for event in response_stream:
+            delta = _extract_stream_event_text_delta(event)
+            if isinstance(delta, str) and delta:
+                chunks.append(delta)
+
+            maybe_response = _extract_stream_event_response(event)
+            if maybe_response is not None:
+                final_response = maybe_response
+
+        if final_response is None and hasattr(response_stream, "get_final_response"):
+            try:
+                final_response = response_stream.get_final_response()
+            except Exception:
+                final_response = None
+
+    raw = "".join(chunks)
+    if raw.strip() == "" and final_response is not None:
+        extracted = _extract_responses_api_output_text(final_response)
+        if isinstance(extracted, str):
+            raw = extracted
+
+    if raw.strip() == "":
+        raise ValueError("LLM returned empty streamed output text")
+
+    return raw
+
+
 def _invoke_llm_via_responses_api(client: OpenAI, prompt: str) -> str:
     """Invoke the LLM using the OpenAI Responses API.
 
@@ -1217,6 +1376,7 @@ def _invoke_llm_via_responses_api(client: OpenAI, prompt: str) -> str:
       - model: gpt-5.3-codex
       - reasoning: high
       - timeout: configured on the client
+      - streaming mode enabled
 
     We request a JSON object output format.
 
@@ -1256,11 +1416,7 @@ def _invoke_llm_via_responses_api(client: OpenAI, prompt: str) -> str:
 
     for kwargs in attempts:
         try:
-            response = client.responses.create(**kwargs)
-            raw = _extract_responses_api_output_text(response)
-            if raw is None or raw.strip() == "":
-                raise ValueError("LLM returned empty output text")
-            return raw
+            return _invoke_llm_streaming_attempt(client, kwargs)
         except TypeError as e:
             # Different OpenAI SDK versions may not accept some kwargs.
             last_type_error = e
@@ -1268,7 +1424,7 @@ def _invoke_llm_via_responses_api(client: OpenAI, prompt: str) -> str:
 
     raise TypeError(
         "OpenAI Responses API invocation failed due to incompatible client library "
-        "(did not accept required arguments for reasoning effort and/or JSON formatting)."
+        "(did not accept required arguments for reasoning effort and JSON formatting in streaming mode)."
     ) from last_type_error
 
 
@@ -1290,11 +1446,12 @@ def main() -> None:
         newly_added_specs = set(untracked_specs)
 
         files = collect_files(root)
+        protected_paths = sorted(_protected_rel_paths(root))
 
         appendix_parts: list[str] = [
             "--- HARNESS CONTEXT ---",
             f"Iteration: {iteration} / {max_iterations}",
-            f"Protected (never edited) path: {CONFIG_REL_PATH}",
+            f"Protected (never edited) paths: {', '.join(protected_paths)}",
             f"Correctness checker configured (controls loop mode): {checker_configured_for_loop}",
             "--- END HARNESS CONTEXT ---",
         ]
