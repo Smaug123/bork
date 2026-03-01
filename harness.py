@@ -780,9 +780,8 @@ def _approval_requirements_from_config(root: Path) -> tuple[bool, set[str]]:
     required: set[str] = set()
 
     # edits-require-approval
-    era_obj: object = cfg.get("edits-require-approval", [])
-    if era_obj is None:
-        era_obj = []
+    era_value = cfg.get("edits-require-approval")
+    era_obj: object = [] if era_value is None else era_value
 
     if not isinstance(era_obj, list):
         print(
@@ -792,7 +791,7 @@ def _approval_requirements_from_config(root: Path) -> tuple[bool, set[str]]:
         )
         require_all = True
     else:
-        for item in era_obj:
+        for item in cast(list[object], era_obj):
             normalized = _normalize_configured_repo_path(item)
             if normalized is None:
                 print(
@@ -1176,9 +1175,11 @@ def _run_correctness_checker(root: Path, checker_cmd: str) -> tuple[bool, str]:
 
     findings_count = 0
     if isinstance(per_file_findings_obj, list):
-        findings_count += len(per_file_findings_obj)
+        per_file_findings = cast(list[object], per_file_findings_obj)
+        findings_count += len(per_file_findings)
     if isinstance(overall_findings_obj, list):
-        findings_count += len(overall_findings_obj)
+        overall_findings = cast(list[object], overall_findings_obj)
+        findings_count += len(overall_findings)
 
     assessment = "unexpected"
     ok = False
@@ -1272,51 +1273,66 @@ def _wants_changes(changes: ChangeSet) -> bool:
     return bool(changes["create-or-update"]) or bool(changes["delete"])
 
 
-def _extract_responses_api_output_text(response: Any) -> str | None:
+def _as_mapping(value: object) -> Mapping[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    return cast(Mapping[str, object], value)
+
+
+def _as_object_list(value: object) -> list[object] | None:
+    if not isinstance(value, list):
+        return None
+    return cast(list[object], value)
+
+
+def _extract_responses_api_output_text(response: object) -> str | None:
     """Best-effort extraction of a text payload from the Responses API result."""
 
     # Newer SDKs expose an aggregated string.
-    output_text = getattr(response, "output_text", None)
-    if isinstance(output_text, str) and output_text.strip() != "":
-        return output_text
+    output_text_obj: object = getattr(response, "output_text", None)
+    if isinstance(output_text_obj, str) and output_text_obj.strip() != "":
+        return output_text_obj
 
-    # Some SDKs return dict-like payloads.
-    if isinstance(response, dict):
-        ot = response.get("output_text")
-        if isinstance(ot, str) and ot.strip() != "":
-            return ot
+    response_map = _as_mapping(response)
+    if response_map is not None:
+        ot_obj = response_map.get("output_text")
+        if isinstance(ot_obj, str) and ot_obj.strip() != "":
+            return ot_obj
 
     # Try to stitch together content blocks.
-    out = getattr(response, "output", None)
-    if out is None and isinstance(response, dict):
-        out = response.get("output")
+    out_obj: object = getattr(response, "output", None)
+    if out_obj is None and response_map is not None:
+        out_obj = response_map.get("output")
 
-    if not isinstance(out, list):
+    out = _as_object_list(out_obj)
+    if out is None:
         return None
 
     texts: list[str] = []
 
     for item in out:
-        content: Any = None
-        if isinstance(item, dict):
-            content = item.get("content")
+        item_map = _as_mapping(item)
+        content_obj: object
+        if item_map is not None:
+            content_obj = item_map.get("content")
         else:
-            content = getattr(item, "content", None)
+            content_obj = getattr(item, "content", None)
 
-        if not isinstance(content, list):
+        content = _as_object_list(content_obj)
+        if content is None:
             continue
 
         for block in content:
-            if isinstance(block, dict):
-                # Common shape: {"type": "output_text", "text": "..."}
-                t = block.get("text")
-                if isinstance(t, str):
-                    texts.append(t)
+            block_map = _as_mapping(block)
+            if block_map is not None:
+                text_obj = block_map.get("text")
+                if isinstance(text_obj, str):
+                    texts.append(text_obj)
                 continue
 
-            t2 = getattr(block, "text", None)
-            if isinstance(t2, str):
-                texts.append(t2)
+            t2_obj: object = getattr(block, "text", None)
+            if isinstance(t2_obj, str):
+                texts.append(t2_obj)
 
     if not texts:
         return None
@@ -1324,49 +1340,60 @@ def _extract_responses_api_output_text(response: Any) -> str | None:
     return "".join(texts)
 
 
-def _extract_stream_event_text_delta(event: Any) -> str | None:
+def _extract_stream_event_text_delta(event: object) -> str | None:
     """Extract output-text delta payload from a streaming Responses API event."""
-    if isinstance(event, dict):
-        event_type = event.get("type")
-        delta = event.get("delta")
-        text = event.get("text")
-    else:
-        event_type = getattr(event, "type", None)
-        delta = getattr(event, "delta", None)
-        text = getattr(event, "text", None)
+    event_map = _as_mapping(event)
+    event_type_obj: object
+    delta_obj: object
+    text_obj: object
 
-    if not (isinstance(event_type, str) and "output_text" in event_type and "delta" in event_type):
+    if event_map is not None:
+        event_type_obj = event_map.get("type")
+        delta_obj = event_map.get("delta")
+        text_obj = event_map.get("text")
+    else:
+        event_type_obj = getattr(event, "type", None)
+        delta_obj = getattr(event, "delta", None)
+        text_obj = getattr(event, "text", None)
+
+    if not (
+        isinstance(event_type_obj, str)
+        and "output_text" in event_type_obj
+        and "delta" in event_type_obj
+    ):
         return None
 
-    if isinstance(delta, str):
-        return delta
+    if isinstance(delta_obj, str):
+        return delta_obj
 
-    if isinstance(delta, dict):
-        t = delta.get("text")
-        if isinstance(t, str):
-            return t
+    delta_map = _as_mapping(delta_obj)
+    if delta_map is not None:
+        delta_text_obj = delta_map.get("text")
+        if isinstance(delta_text_obj, str):
+            return delta_text_obj
 
-    t2 = getattr(delta, "text", None)
-    if isinstance(t2, str):
-        return t2
+    delta_text_attr_obj: object = getattr(delta_obj, "text", None)
+    if isinstance(delta_text_attr_obj, str):
+        return delta_text_attr_obj
 
-    if isinstance(text, str):
-        return text
+    if isinstance(text_obj, str):
+        return text_obj
 
     return None
 
 
-def _extract_stream_event_response(event: Any) -> Any | None:
+def _extract_stream_event_response(event: object) -> object | None:
     """Best-effort extraction of a final response object from a stream event."""
-    if isinstance(event, dict):
-        return event.get("response")
+    event_map = _as_mapping(event)
+    if event_map is not None:
+        return event_map.get("response")
     return getattr(event, "response", None)
 
 
 def _invoke_llm_streaming_attempt(client: OpenAI, kwargs: Mapping[str, object]) -> str:
     """Invoke Responses API in streaming mode and return concatenated output text."""
     chunks: list[str] = []
-    final_response: Any | None = None
+    final_response: object | None = None
 
     responses_api: Any = client.responses
     stream_callable: Any = getattr(responses_api, "stream", None)
