@@ -8,7 +8,9 @@
         "scripts/devshell-smoke-test.sh",
         "scripts/docker-warmup.sh",
         ".dockerignore",
-        "docker/Dockerfile"
+        "docker/Dockerfile",
+        "uv.lock",
+        "pyproject.toml"
     ],
     "correctness-checker": "./correctness-check.py"
 }
