@@ -4,14 +4,14 @@
 Implements the reconciliation loop defined in specs/edit-loop.md.
 
 Notably:
-- Omits `.gitignore`'d files, `.git`, and the configured correctness checker from the prompt.
-- Does not modify `.git/`.
-- Does not modify `.config/bork.json` (user configuration).
-- Does not modify the configured correctness checker executable.
+- Omits `.gitignore`'d files, the configured correctness checker, and configured `not-sent`
+  files from prompt contents.
+- For files in `not-sent`, includes the filepath in the prompt while redacting contents.
 - Prints attempted contents when the model tries to write forbidden paths.
 - Requires per-change human approval for edits to `specs/`.
 - Requires per-change human approval for edits to any paths configured in `.config/bork.json`'s
   `edits-require-approval` list.
+- Rejects edits to files in `.config/bork.json`'s `not-sent` list by silently discarding them.
 - Can run an optional correctness checker configured in `.config/bork.json`.
 - Invokes the OpenAI Responses API in streaming mode.
 - Supports debug logging of LLM requests/responses via `BORK_ENABLE_DEBUG_LOG=1`.
@@ -33,11 +33,10 @@ from openai import OpenAI
 SKIP_DIRS = {".git", ".direnv", "__pycache__", ".claude"}
 
 CONFIG_REL_PATH = ".config/bork.json"
-PROTECTED_REL_PATHS = {CONFIG_REL_PATH}
 
 # Per specs/llm-api-usage.md
 LLM_MODEL = "gpt-5.3-codex"
-LLM_REASONING_EFFORT = "high"
+LLM_REASONING_EFFORT = "xhigh"
 
 ChangeSet = TypedDict("ChangeSet", {"create-or-update": dict[str, str], "delete": list[str]})
 BorkConfig = dict[str, object]
@@ -247,7 +246,7 @@ def _collect_files_via_git(root: Path, *, excluded_paths: set[str] | None = None
     if not _in_git_repo(root):
         return None
 
-    excluded: set[str] = excluded_paths if excluded_paths is not None else set[str]()
+    excluded: set[str] = excluded_paths if excluded_paths is not None else set()
     ignore_patterns = _load_gitignore_patterns(root)
 
     # Tracked files (cached) + untracked (others) excluding ignored.
@@ -280,14 +279,52 @@ def _collect_files_via_git(root: Path, *, excluded_paths: set[str] | None = None
     return files
 
 
-def collect_files(root: Path) -> dict[str, str]:
-    """Collect all text files in the repo, omitting `.gitignore`'d files and the configured correctness checker."""
+def _existing_not_sent_files(root: Path, not_sent_paths: set[str]) -> set[str]:
+    """Return configured not-sent paths that currently exist as non-ignored files."""
+    ignore_patterns = _load_gitignore_patterns(root)
+    existing: set[str] = set()
+
+    for rel in sorted(not_sent_paths):
+        if any(part in SKIP_DIRS for part in Path(rel).parts):
+            continue
+        if _is_ignored(rel, ignore_patterns):
+            continue
+
+        p = root / rel
+        try:
+            if p.is_file():
+                existing.add(rel)
+        except OSError:
+            continue
+
+    return existing
+
+
+def collect_files(root: Path) -> tuple[dict[str, str], set[str]]:
+    """Collect text files under root.
+
+    Omits:
+      - `.gitignore`'d files
+      - configured correctness checker
+      - configured `not-sent` file contents
+
+    Returns:
+      (files_with_contents, redacted_file_paths)
+    """
     checker_rel = _configured_correctness_checker_repo_path(root)
-    excluded_paths: set[str] = {checker_rel} if checker_rel is not None else set[str]()
+    not_sent_paths = _not_sent_paths_from_config(root)
+
+    redacted_paths = _existing_not_sent_files(root, not_sent_paths)
+    if checker_rel is not None:
+        redacted_paths.discard(checker_rel)
+
+    excluded_paths: set[str] = set(redacted_paths)
+    if checker_rel is not None:
+        excluded_paths.add(checker_rel)
 
     git_files = _collect_files_via_git(root, excluded_paths=excluded_paths)
     if git_files is not None:
-        return git_files
+        return git_files, redacted_paths
 
     # Fallback (no git): approximate using top-level .gitignore patterns.
     files: dict[str, str] = {}
@@ -310,7 +347,8 @@ def collect_files(root: Path) -> dict[str, str]:
             files[rel] = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, PermissionError, OSError):
             pass
-    return files
+
+    return files, redacted_paths
 
 
 def compute_specs_status(root: Path) -> tuple[str | None, str, list[str]]:
@@ -344,12 +382,14 @@ def compute_specs_status(root: Path) -> tuple[str | None, str, list[str]]:
 def build_prompt(
     files: dict[str, str],
     *,
+    redacted_paths: set[str] | None = None,
     specs_baseline_ref: str | None = None,
     specs_diff_text: str = "",
     newly_added_specs: set[str] | None = None,
     appended_text: str = "",
 ) -> str:
     """Build the concatenated codebase + specs prompt."""
+    redacted_paths = redacted_paths or set()
     newly_added_specs = newly_added_specs or set()
 
     # Optional: include a specs/ diff vs main branch, if present.
@@ -378,11 +418,23 @@ def build_prompt(
         extra_sections.append("\n".join(lines))
 
     parts: list[str] = []
-    for path, content in sorted(files.items()):
+    all_paths = sorted(set(files.keys()) | set(redacted_paths))
+    for path in all_paths:
+        tags: list[str] = []
         if path in newly_added_specs:
-            parts.append(f"--- FILE (newly added): {path} ---\n{content}\n--- END FILE: {path} ---")
+            tags.append("newly added")
+        if path in redacted_paths:
+            tags.append("contents omitted (configured as not-sent)")
+
+        tag_text = f" ({', '.join(tags)})" if tags else ""
+        header = f"--- FILE{tag_text}: {path} ---"
+
+        if path in redacted_paths:
+            content = "<contents omitted by harness (configured in .config/bork.json:not-sent)>"
         else:
-            parts.append(f"--- FILE: {path} ---\n{content}\n--- END FILE: {path} ---")
+            content = files[path]
+
+        parts.append(f"{header}\n{content}\n--- END FILE: {path} ---")
 
     joined = "\n\n".join([*extra_sections, *parts])
     if appended_text.strip():
@@ -395,13 +447,16 @@ def build_prompt(
         "compliance with the specs.\n\n"
         "Do not assume that any given piece of code is currently correct. "
         "Treat the current codebase and the specs as potentially divergent, and reconcile them.\n\n"
+        "Changes to specs should be a last resort; by default, prefer changing code over changing specs. "
+        "Only change specs if they are contradictory.\n\n"
         "Respond with ONLY a JSON object (no markdown fencing) with this exact schema:\n"
         '{"create-or-update": {"filepath": "file contents", ...}, "delete": ["filepath", ...]}\n\n'
         "If no changes are needed, return: "
         '{"create-or-update": {}, "delete": []}\n\n'
         "Notes:\n"
         "- You may propose changes to any files, including specs in specs/*.md, but spec changes are discouraged and may require human approval to apply.\n"
-        "- Do not use filesystem traversal in paths (e.g., ../foo).\n\n"
+        "- Do not use filesystem traversal in paths (e.g., ../foo).\n"
+        "- All paths are relative to the source directory argument passed to the harness.\n\n"
         f"{joined}"
     )
 
@@ -704,13 +759,15 @@ def _is_protected_path(rel: str, protected_paths: set[str]) -> bool:
 
 
 def _normalize_configured_repo_path(raw: object) -> str | None:
-    """Normalize a repo-relative path sourced from user config.
+    """Normalize a configured safe relative path.
 
-    The config examples use a leading "./" (e.g. "./correctness.py"). We accept and strip
-    that prefix, while still rejecting absolute paths, backslashes, NUL bytes, and traversal
-    via "..". We also reject embedded "." path segments (e.g. "foo/./bar").
-
-    Returns a normalized posix relative path, or None if invalid.
+    Accepts optional leading "./" and rejects:
+      - absolute paths
+      - drive-qualified paths
+      - backslashes
+      - NUL bytes
+      - traversal ("..")
+      - explicit no-op segments (".")
     """
     if not isinstance(raw, str):
         return None
@@ -741,7 +798,7 @@ def _normalize_configured_repo_path(raw: object) -> str | None:
 
 
 def _configured_correctness_checker_repo_path(root: Path) -> str | None:
-    """Return configured correctness checker path as a normalized repo-relative path, if valid."""
+    """Return configured correctness checker path as a normalized relative path, if valid."""
     cfg, err = _read_bork_config(root)
     if err is not None or cfg is None:
         return None
@@ -754,8 +811,8 @@ def _configured_correctness_checker_repo_path(root: Path) -> str | None:
 
 
 def _protected_rel_paths(root: Path) -> set[str]:
-    """Return repo-relative paths that are immutable to LLM-proposed edits."""
-    protected = set(PROTECTED_REL_PATHS)
+    """Return relative paths that are immutable to LLM-proposed edits."""
+    protected: set[str] = set()
 
     checker_rel = _configured_correctness_checker_repo_path(root)
     if checker_rel is not None:
@@ -795,16 +852,49 @@ def _approval_requirements_from_config(root: Path) -> tuple[bool, set[str]]:
             normalized = _normalize_configured_repo_path(item)
             if normalized is None:
                 print(
-                    f"Warning: ignoring invalid entry in edits-require-approval: {item!r} (must be a safe repo-relative path)",
+                    f"Warning: ignoring invalid entry in edits-require-approval: {item!r} "
+                    "(must be a safe source-relative path)",
                     file=sys.stderr,
                 )
-                continue
-            if normalized in PROTECTED_REL_PATHS:
-                # The config file itself is always immutable.
                 continue
             required.add(normalized)
 
     return require_all, required
+
+
+def _not_sent_paths_from_config(root: Path) -> set[str]:
+    """Return normalized configured not-sent paths (relative to source directory)."""
+    cfg, err = _read_bork_config(root)
+    if err is not None:
+        print(f"Warning: {err}. Ignoring not-sent configuration.", file=sys.stderr)
+        return set()
+
+    if cfg is None:
+        return set()
+
+    ns_value = cfg.get("not-sent")
+    if ns_value is None:
+        return set()
+
+    if not isinstance(ns_value, list):
+        print(
+            f"Warning: {CONFIG_REL_PATH} field 'not-sent' must be a list of strings. Ignoring it.",
+            file=sys.stderr,
+        )
+        return set()
+
+    out: set[str] = set()
+    for item in cast(list[object], ns_value):
+        normalized = _normalize_configured_repo_path(item)
+        if normalized is None:
+            print(
+                f"Warning: ignoring invalid entry in not-sent: {item!r} (must be a safe source-relative path)",
+                file=sys.stderr,
+            )
+            continue
+        out.add(normalized)
+
+    return out
 
 
 def _read_text_best_effort(p: Path) -> str:
@@ -845,7 +935,26 @@ def apply_changes(changes: ChangeSet, root: Path) -> None:
     delete_list = validated_delete
 
     protected_paths = _protected_rel_paths(root)
+    not_sent_paths = _not_sent_paths_from_config(root)
     require_all_approval, approval_paths = _approval_requirements_from_config(root)
+
+    # Silently discard edits to not-sent paths (unless the path is protected for a stricter reason).
+    filtered_create: dict[str, str] = {}
+    for rel, content in create_map.items():
+        rel_norm = _normalize_rel_path(rel)
+        if rel_norm in not_sent_paths and rel_norm not in protected_paths:
+            continue
+        filtered_create[rel] = content
+
+    filtered_delete: list[str] = []
+    for rel in delete_list:
+        rel_norm = _normalize_rel_path(rel)
+        if rel_norm in not_sent_paths and rel_norm not in protected_paths:
+            continue
+        filtered_delete.append(rel)
+
+    create_map = filtered_create
+    delete_list = filtered_delete
 
     def _requires_human_approval(rel: str) -> bool:
         if require_all_approval:
@@ -874,10 +983,6 @@ def apply_changes(changes: ChangeSet, root: Path) -> None:
 
     # Apply non-spec changes.
     for rel, content in normal_create.items():
-        parts = Path(rel).parts
-        if parts and parts[0] == ".git":
-            _print_refused_create_attempt(rel, content, reason="writes under .git are forbidden")
-            continue
         if _is_protected_path(rel, protected_paths):
             _print_refused_create_attempt(
                 rel,
@@ -904,10 +1009,6 @@ def apply_changes(changes: ChangeSet, root: Path) -> None:
         print(f"  wrote: {rel}", file=sys.stderr)
 
     for rel in normal_delete:
-        parts = Path(rel).parts
-        if parts and parts[0] == ".git":
-            _print_refused_delete_attempt(rel, reason="deletes under .git are forbidden")
-            continue
         if _is_protected_path(rel, protected_paths):
             _print_refused_delete_attempt(
                 rel,
@@ -957,11 +1058,6 @@ def apply_changes(changes: ChangeSet, root: Path) -> None:
     pending_spec: ChangeSet = _empty_change_set()
 
     for rel, new_content in spec_create.items():
-        parts = Path(rel).parts
-        if parts and parts[0] == ".git":
-            _print_refused_create_attempt(rel, new_content, reason="writes under .git are forbidden")
-            continue
-
         old_content = _read_text_best_effort(root / rel)
 
         print(f"\n--- PROPOSED SPEC CHANGE: {rel} ---", file=sys.stderr)
@@ -976,11 +1072,6 @@ def apply_changes(changes: ChangeSet, root: Path) -> None:
             print(f"  pending (spec change requires approval): {rel}", file=sys.stderr)
 
     for rel in spec_delete:
-        parts = Path(rel).parts
-        if parts and parts[0] == ".git":
-            _print_refused_delete_attempt(rel, reason="deletes under .git are forbidden")
-            continue
-
         old_content = _read_text_best_effort(root / rel)
         print(f"\n--- PROPOSED SPEC DELETE: {rel} ---", file=sys.stderr)
         _print_unified_diff(old_content, "", fromfile=f"a/{rel}", tofile=f"b/{rel}")
@@ -1449,7 +1540,7 @@ def _invoke_llm_via_responses_api(client: OpenAI, prompt: str) -> str:
 
     Per specs/llm-api-usage.md:
       - model: gpt-5.3-codex
-      - reasoning: high
+      - reasoning: xhigh
       - timeout: configured on the client
       - streaming mode enabled
 
@@ -1503,8 +1594,23 @@ def _invoke_llm_via_responses_api(client: OpenAI, prompt: str) -> str:
     ) from last_type_error
 
 
-def main() -> None:
-    root = Path.cwd()
+def _parse_source_dir_from_argv(argv: list[str]) -> Path:
+    prog = Path(argv[0]).name if argv else "harness.py"
+    if len(argv) != 2:
+        print(f"Usage: {prog} <source-directory>", file=sys.stderr)
+        raise SystemExit(2)
+
+    candidate = Path(argv[1]).expanduser()
+    if not candidate.exists() or not candidate.is_dir():
+        print(f"Source directory does not exist or is not a directory: {candidate}", file=sys.stderr)
+        raise SystemExit(2)
+
+    return candidate.resolve()
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = sys.argv if argv is None else argv
+    root = _parse_source_dir_from_argv(argv)
 
     # Spec: only loop once when there is no correctness checker configured.
     checker_configured_for_loop = _correctness_checker_configured_for_loop(root)
@@ -1512,7 +1618,7 @@ def main() -> None:
 
     appended_failures: list[str] = []
 
-    # Spec: use the most advanced OpenAI model (currently gpt-5.3-codex) with high reasoning,
+    # Spec: use the most advanced OpenAI model (currently gpt-5.3-codex) with xhigh reasoning,
     # and a 1 hour timeout on requests.
     client = OpenAI(timeout=60 * 60)
 
@@ -1520,13 +1626,14 @@ def main() -> None:
         specs_baseline, specs_diff_text, untracked_specs = compute_specs_status(root)
         newly_added_specs = set(untracked_specs)
 
-        files = collect_files(root)
+        files, redacted_paths = collect_files(root)
         protected_paths = sorted(_protected_rel_paths(root))
+        protected_display = ", ".join(protected_paths) if protected_paths else "(none)"
 
         appendix_parts: list[str] = [
             "--- HARNESS CONTEXT ---",
             f"Iteration: {iteration} / {max_iterations}",
-            f"Protected (never edited) paths: {', '.join(protected_paths)}",
+            f"Protected (never edited) paths: {protected_display}",
             f"Correctness checker configured (controls loop mode): {checker_configured_for_loop}",
             "--- END HARNESS CONTEXT ---",
         ]
@@ -1537,13 +1644,17 @@ def main() -> None:
 
         prompt = build_prompt(
             files,
+            redacted_paths=redacted_paths,
             specs_baseline_ref=specs_baseline,
             specs_diff_text=specs_diff_text,
             newly_added_specs=newly_added_specs,
             appended_text="\n".join(appendix_parts),
         )
 
-        print(f"Collected {len(files)} files; iteration {iteration}/{max_iterations}; sending to LLM...", file=sys.stderr)
+        print(
+            f"Collected {len(files)} files ({len(redacted_paths)} redacted); iteration {iteration}/{max_iterations}; sending to LLM...",
+            file=sys.stderr,
+        )
         _debug_log_block("LLM REQUEST", prompt)
 
         raw = _invoke_llm_via_responses_api(client, prompt)
@@ -1603,4 +1714,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv)
