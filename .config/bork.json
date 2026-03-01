@@ -1,19 +1,5 @@
 {
-    "edits-require-approval": [
-        "flake.nix",
-        "flake.lock",
-        ".envrc",
-        "scripts/bork-sandbox-build.sh",
-        "scripts/bork-sandbox-shell.sh",
-        "scripts/devshell-smoke-test.sh",
-        "scripts/docker-warmup.sh",
-        ".dockerignore",
-        "docker/Dockerfile",
-        "pyproject.toml",
-        "pyrightconfig.json"
-    ],
-    "not-sent": [
-        "uv.lock"
-    ],
+    "edits-require-approval": [],
+    "not-sent": [],
     "correctness-checker": "./correctness-check.py"
 }
