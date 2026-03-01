@@ -9,9 +9,11 @@
         "scripts/docker-warmup.sh",
         ".dockerignore",
         "docker/Dockerfile",
-        "uv.lock",
         "pyproject.toml",
         "pyrightconfig.json"
+    ],
+    "not-sent": [
+        "uv.lock"
     ],
     "correctness-checker": "./correctness-check.py"
 }

@@ -21,6 +21,45 @@ def _decode_or_placeholder(raw: bytes) -> str:
         return NON_UTF8
 
 
+def _collect_review_comments() -> tuple[list[dict[str, str | int]], list[dict[str, str | int]]]:
+    """Interactively collect review comments from the user.
+
+    Returns (per_file_findings, overall_findings).
+    Skips silently if stdin is not a terminal.
+    """
+    per_file: list[dict[str, str | int]] = []
+    overall: list[dict[str, str | int]] = []
+
+    if not sys.stdin.isatty():
+        return per_file, overall
+
+    while True:
+        print("\nReview comment (empty line to finish):", file=sys.stderr, flush=True)
+        try:
+            finding_text = input()
+        except EOFError:
+            break
+
+        if not finding_text.strip():
+            break
+
+        print("File path (empty for overall finding):", file=sys.stderr, flush=True)
+        try:
+            file_path = input()
+        except EOFError:
+            file_path = ""
+
+        finding: dict[str, str | int] = {"provenance": "code-review", "finding": finding_text.strip()}
+
+        if file_path.strip():
+            finding["file"] = file_path.strip()
+            per_file.append(finding)
+        else:
+            overall.append(finding)
+
+    return per_file, overall
+
+
 def main() -> None:
     try:
         subprocess.run(["uv", "sync"], capture_output=True, check=True)
@@ -28,6 +67,9 @@ def main() -> None:
         print(json.dumps({"per_file_findings": [], "overall_findings": []}))
         print(f"correctness checker failed to sync venv: {e}", file=sys.stderr)
         sys.exit(2)
+
+    per_file_findings: list[dict[str, str | int]] = []
+    overall_findings: list[dict[str, str | int]] = []
 
     # Pyright reads typeCheckingMode from pyrightconfig.json.
     # Create a temporary one with strict mode if none exists.
@@ -53,26 +95,22 @@ def main() -> None:
             except OSError:
                 pass
 
-    stdout = _decode_or_placeholder(result.stdout)
-    stderr = _decode_or_placeholder(result.stderr)
-    exit_code = result.returncode
-
-    if exit_code == 0:
-        # Pyright found no errors.
-        print(json.dumps({"per_file_findings": [], "overall_findings": []}))
-        sys.exit(0)
-    else:
-        # Pyright found errors (exit 1) or had a fatal error (exit 2+).
-        # Either way, report as a command finding.
-        finding = {
+    if result.returncode != 0:
+        overall_findings.append({
             "provenance": "command",
             "command": COMMAND,
-            "stdout": stdout,
-            "stderr": stderr,
-            "exit-code": exit_code,
-        }
-        print(json.dumps({"per_file_findings": [], "overall_findings": [finding]}))
-        sys.exit(1)
+            "stdout": _decode_or_placeholder(result.stdout),
+            "stderr": _decode_or_placeholder(result.stderr),
+            "exit-code": result.returncode,
+        })
+
+    review_per_file, review_overall = _collect_review_comments()
+    per_file_findings.extend(review_per_file)
+    overall_findings.extend(review_overall)
+
+    output = {"per_file_findings": per_file_findings, "overall_findings": overall_findings}
+    print(json.dumps(output))
+    sys.exit(1 if per_file_findings or overall_findings else 0)
 
 
 if __name__ == "__main__":
