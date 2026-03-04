@@ -1,5 +1,5 @@
 {
     "edits-require-approval": [],
     "not-sent": [],
-    "correctness-checker": "./correctness-check.py"
+    "correctness-checker": "./correctness_check.py"
 }

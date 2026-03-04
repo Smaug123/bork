@@ -9,6 +9,8 @@ import subprocess
 import sys
 
 import openai
+
+from finding_types import CodeReviewFinding
 from openai.types.responses.response_format_text_json_schema_config_param import (
     ResponseFormatTextJSONSchemaConfigParam,
 )
@@ -103,7 +105,7 @@ def _build_prompt(changed_files: list[str], diff: str) -> str:
     return '\n'.join(parts)
 
 
-def review() -> list[dict[str, str]]:
+def review() -> list[CodeReviewFinding]:
     """Run LLM code review on files changed since main.
 
     Returns a list of correctness-checker findings with provenance 'code-review'.
@@ -130,12 +132,12 @@ def review() -> list[dict[str, str]]:
     )
 
     parsed = json.loads(response.output_text)
-    findings: list[dict[str, str]] = []
+    findings: list[CodeReviewFinding] = []
     for comment in parsed.get('comments', []):
-        finding: dict[str, str] = {
-            'provenance': 'code-review',
-            'finding': comment['finding'],
-        }
+        finding = CodeReviewFinding(
+            provenance='code-review',
+            finding=comment['finding'],
+        )
         if comment.get('file'):
             finding['file'] = comment['file']
         findings.append(finding)

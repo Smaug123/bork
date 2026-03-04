@@ -5,6 +5,8 @@ import os
 import subprocess
 import sys
 
+from finding_types import CodeReviewFinding, CommandFinding, Finding
+
 NON_UTF8 = "<non-UTF8 output>"
 COMMAND = "uv run --group dev pyright ."
 
@@ -23,8 +25,8 @@ def main() -> None:
         print(f"correctness checker failed to sync venv: {e}", file=sys.stderr)
         sys.exit(2)
 
-    per_file_findings: list[dict[str, str | int]] = []
-    overall_findings: list[dict[str, str | int]] = []
+    per_file_findings: list[CodeReviewFinding] = []
+    overall_findings: list[Finding] = []
 
     # Pyright reads typeCheckingMode from pyrightconfig.json.
     # Create a temporary one with strict mode if none exists.
@@ -51,21 +53,20 @@ def main() -> None:
                 pass
 
     if result.returncode != 0:
-        overall_findings.append({
-            "provenance": "command",
-            "command": COMMAND,
-            "stdout": _decode_or_placeholder(result.stdout),
-            "stderr": _decode_or_placeholder(result.stderr),
-            "exit-code": result.returncode,
-        })
+        overall_findings.append(CommandFinding(
+            provenance="command",
+            command=COMMAND,
+            stdout=_decode_or_placeholder(result.stdout),
+            stderr=_decode_or_placeholder(result.stderr),
+            **{"exit-code": result.returncode},
+        ))
 
     # LLM code review of changed files.
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         sys.path.insert(0, script_dir)
         import llm_review
-        review_findings: list[dict[str, str | int]] = llm_review.review()
-        for finding in review_findings:
+        for finding in llm_review.review():
             if 'file' in finding:
                 per_file_findings.append(finding)
             else:
