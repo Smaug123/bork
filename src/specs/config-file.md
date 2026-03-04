@@ -5,6 +5,7 @@ description: Defines the user-written file that configures the Bork system.
 ---
 
 There are a few knobs the user can turn in the Bork system; those knobs are configured in the `.config/bork.json` file at the root of the repository.
+(Note that this is *not* within [the directory supplied to the harness](./harness-invocation.md).)
 
 # JSON file format
 

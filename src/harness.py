@@ -36,7 +36,7 @@ CONFIG_REL_PATH = ".config/bork.json"
 
 # Per specs/llm-api-usage.md
 LLM_MODEL = "gpt-5.3-codex"
-LLM_REASONING_EFFORT = "xhigh"
+LLM_REASONING_EFFORT = "high"
 
 ChangeSet = TypedDict("ChangeSet", {"create-or-update": dict[str, str], "delete": list[str]})
 BorkConfig = dict[str, object]
@@ -1493,6 +1493,8 @@ def _invoke_llm_streaming_attempt(client: OpenAI, kwargs: Mapping[str, object]) 
         stream_cm: Any = stream_callable(**kwargs)
         with stream_cm as stream:
             for event in stream:
+                if _debug_log_enabled():
+                    print(f"--- DEBUG: STREAM EVENT {getattr(event, 'type', type(event).__name__)} ---", file=sys.stderr)
                 delta = _extract_stream_event_text_delta(event)
                 if isinstance(delta, str) and delta:
                     chunks.append(delta)
@@ -1509,6 +1511,8 @@ def _invoke_llm_streaming_attempt(client: OpenAI, kwargs: Mapping[str, object]) 
     else:
         response_stream: Any = responses_api.create(stream=True, **kwargs)
         for event in response_stream:
+            if _debug_log_enabled():
+                print(f"--- DEBUG: STREAM EVENT {getattr(event, 'type', type(event).__name__)} ---", file=sys.stderr)
             delta = _extract_stream_event_text_delta(event)
             if isinstance(delta, str) and delta:
                 chunks.append(delta)
@@ -1540,7 +1544,7 @@ def _invoke_llm_via_responses_api(client: OpenAI, prompt: str) -> str:
 
     Per specs/llm-api-usage.md:
       - model: gpt-5.3-codex
-      - reasoning: xhigh
+      - reasoning: high
       - timeout: configured on the client
       - streaming mode enabled
 
@@ -1618,7 +1622,7 @@ def main(argv: list[str] | None = None) -> None:
 
     appended_failures: list[str] = []
 
-    # Spec: use the most advanced OpenAI model (currently gpt-5.3-codex) with xhigh reasoning,
+    # Spec: use the most advanced OpenAI model (currently gpt-5.3-codex) with high reasoning,
     # and a 1 hour timeout on requests.
     client = OpenAI(timeout=60 * 60)
 
