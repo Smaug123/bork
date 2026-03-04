@@ -1,9 +1,4 @@
-#!/usr/bin/env -S python3 -I
-
-# Thanks Python for making this vulnerability so easy:
-# If a file `json.py` is placed next to this script, then
-# *that* `json.py` will be imported instead of stdlib `json`.
-# The fix is to use `-I`, which ignores PYTHONPATH and removes the script's directory from `sys.path`.
+#!/usr/bin/env python3
 
 import json
 import os
@@ -63,6 +58,20 @@ def main() -> None:
             "stderr": _decode_or_placeholder(result.stderr),
             "exit-code": result.returncode,
         })
+
+    # LLM code review of changed files.
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        sys.path.insert(0, script_dir)
+        import llm_review
+        review_findings: list[dict[str, str | int]] = llm_review.review()
+        for finding in review_findings:
+            if 'file' in finding:
+                per_file_findings.append(finding)
+            else:
+                overall_findings.append(finding)
+    except Exception as e:
+        print(f"correctness checker: LLM review failed: {e}", file=sys.stderr)
 
     output = {"per_file_findings": per_file_findings, "overall_findings": overall_findings}
     print(json.dumps(output))
