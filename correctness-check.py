@@ -20,7 +20,6 @@ def _decode_or_placeholder(raw: bytes) -> str:
     except (UnicodeDecodeError, AttributeError):
         return NON_UTF8
 
-
 def main() -> None:
     try:
         subprocess.run(["uv", "sync"], capture_output=True, check=True)
@@ -28,6 +27,9 @@ def main() -> None:
         print(json.dumps({"per_file_findings": [], "overall_findings": []}))
         print(f"correctness checker failed to sync venv: {e}", file=sys.stderr)
         sys.exit(2)
+
+    per_file_findings: list[dict[str, str | int]] = []
+    overall_findings: list[dict[str, str | int]] = []
 
     # Pyright reads typeCheckingMode from pyrightconfig.json.
     # Create a temporary one with strict mode if none exists.
@@ -53,26 +55,18 @@ def main() -> None:
             except OSError:
                 pass
 
-    stdout = _decode_or_placeholder(result.stdout)
-    stderr = _decode_or_placeholder(result.stderr)
-    exit_code = result.returncode
-
-    if exit_code == 0:
-        # Pyright found no errors.
-        print(json.dumps({"per_file_findings": [], "overall_findings": []}))
-        sys.exit(0)
-    else:
-        # Pyright found errors (exit 1) or had a fatal error (exit 2+).
-        # Either way, report as a command finding.
-        finding = {
+    if result.returncode != 0:
+        overall_findings.append({
             "provenance": "command",
             "command": COMMAND,
-            "stdout": stdout,
-            "stderr": stderr,
-            "exit-code": exit_code,
-        }
-        print(json.dumps({"per_file_findings": [], "overall_findings": [finding]}))
-        sys.exit(1)
+            "stdout": _decode_or_placeholder(result.stdout),
+            "stderr": _decode_or_placeholder(result.stderr),
+            "exit-code": result.returncode,
+        })
+
+    output = {"per_file_findings": per_file_findings, "overall_findings": overall_findings}
+    print(json.dumps(output))
+    sys.exit(1 if per_file_findings or overall_findings else 0)
 
 
 if __name__ == "__main__":

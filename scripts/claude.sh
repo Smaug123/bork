@@ -13,9 +13,23 @@ if command -v claude-code >/dev/null 2>&1; then
 fi
 
 # Try to find an underlying `claude` binary by removing this wrapper's directory from PATH.
+# When invoked as `claude` (without a slash), resolve `$0` via `command -v` so we can identify
+# the real directory of this wrapper rather than treating it as ".".
 self="$0"
 case "$self" in
-  */*) self_dir=${self%/*} ;;
+  */*)
+    self_path="$self"
+    ;;
+  *)
+    self_path="$(command -v "$self" 2>/dev/null || true)"
+    if [ -z "$self_path" ]; then
+      self_path="$self"
+    fi
+    ;;
+esac
+
+case "$self_path" in
+  */*) self_dir=${self_path%/*} ;;
   *) self_dir="." ;;
 esac
 

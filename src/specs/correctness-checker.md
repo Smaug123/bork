@@ -54,3 +54,5 @@ Fields:
 # Security note
 
 The user is expected always to operate the harness (and therefore the correctness checker which the harness invokes) within a sandboxed environment, so the harness need not make any attempt to constrain the behaviour of the correctness checker to "safe" actions.
+
+The user should not put the correctness checker anywhere inside the folder with which they invoke the harness, because that would greatly increase the LLM's surface area for reward hacking through manipulating the behaviour of the checker.
