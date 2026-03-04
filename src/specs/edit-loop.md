@@ -83,6 +83,8 @@ The harness prevents symlink attacks when writing the files out.
 
 If the LLM *does* try and edit a file which the harness refuses access to (like the correctness checker), the harness prints out the attempted contents.
 
+The harness additionally prints to stderr the LLM's commentary about implementation decisions taken.
+
 # Commencing the next loop
 
 Once the harness has written the output, it performs any correctness checks which may be specified, by running [the correctness checker](./correctness-checker.md) if it exists.
