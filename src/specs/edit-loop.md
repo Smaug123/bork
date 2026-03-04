@@ -16,7 +16,7 @@ The harness omits certain files:
 
 * anything `.gitignore`'d
 * any configured [correctness checker](./correctness-checker.md) (this is to help prevent the LLM from gaming the correctness checker)
-* anything in `.config/bork.yaml`'s `"not-sent"` section (instead noting to the LLM that the file exists, but its contents are redacted).
+* anything in `.config/bork.json`'s `"not-sent"` section (instead noting to the LLM that the file exists, but its contents are redacted).
 
 (A current design assumption is that there are no nested Git directories.)
 
@@ -33,20 +33,37 @@ The actual prompt given to the LLM has the following properties:
 * It encourages the model not to assume that any given piece of code is currently correct. (This is because the changes to the spec may be heavily divergent from the code, and the reconciliation loop must help them converge.)
 * It emphasises that changes to the spec are a last resort and by default should only be performed if the specs themselves are contradictory (perhaps mutually contradictory). The direction of reconciliation should almost always be to change the code, not the specs.
 
-# Output format
+# Intermediate output (e.g. tool calls)
+
+The OpenAI tool calling API is used to make available the following tools.
+In response to the tool call, the harness interactively transmits the LLM's request to the user, and receives a free text response which is fed back to the LLM to continue the conversation that makes up this iteration of the edit loop.
+
+## resolve-spec-contradiction
+
+When the LLM sees a contradiction within a spec or across several specs, it can tell us.
+The LLM tells us which spec files are involved and gives us text snippets from those files, and identifies the nature of the contradiction.
+
+## incomplete-spec
+
+When the LLM finds that the specs are insufficient to take some decision, it can tell us.
+The LLM tells us which spec files are involved (if any), and gives us descriptions of the nature of the incompleteness (the degrees of freedom still open).
+
+# Final output format from one iteration
 
 The LLM returns JSON of this format, where the keys of the `create-or-update` object indicate what files should exist:
 
 ```json
 {
+    "high-level-description": "A free-text description of changes performed, describing 'why' rather than 'what'.",
+    "implementation-decisions": ["Free-text descriptions of any noteworthy decisions taken."],
     "create-or-update": {
-        "foo/bar.py": "import os\n..."
+        "foo/bar.py": {"rationale": "some rationale for an edit, or n/a if the change is routine", "contents": "import os\n..."}
     },
-    "delete": ["foo/baz.py"]
+    "delete": [{"rationale": "rationale, or n/a if the change is routine", "file": "foo/baz.py"}],
 }
 ```
 
-Files in `specs` *may* appear in this output, but the model is strongly encouraged not to change the specs.
+Files in `specs` *may* be `create-or-update`d or even `delete`d, but the model is strongly encouraged not to do so unless it's incorporating the results of explicit tool calls to the user.
 
 All paths are relative to the source directory command-line argument to the harness.
 
@@ -70,6 +87,9 @@ If the LLM *does* try and edit a file which the harness refuses access to (like 
 
 Once the harness has written the output, it performs any correctness checks which may be specified, by running [the correctness checker](./correctness-checker.md) if it exists.
 If any correctness checks fail, the harness commences a new loop, this time appending to the prompt the failing output in a format the LLM can consume.
+
+The correctness checker is invoked in such a way that the user who is running the harness can see its stderr, and can supply stdin.
+(This is so that a human reviewer can form part of the edit loop: the correctness checker is free to interactively ask the user for comments, for example.)
 
 # Breaking out of the loop
 

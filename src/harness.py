@@ -1,1721 +1,606 @@
-#!/usr/bin/env python3
-"""Coding harness: reads specs and codebase, asks an LLM to bring codebase into compliance.
+from __future__ import annotations
 
-Implements the reconciliation loop defined in specs/edit-loop.md.
-
-Notably:
-- Omits `.gitignore`'d files, the configured correctness checker, and configured `not-sent`
-  files from prompt contents.
-- For files in `not-sent`, includes the filepath in the prompt while redacting contents.
-- Prints attempted contents when the model tries to write forbidden paths.
-- Requires per-change human approval for edits to `specs/`.
-- Requires per-change human approval for edits to any paths configured in `.config/bork.json`'s
-  `edits-require-approval` list.
-- Rejects edits to files in `.config/bork.json`'s `not-sent` list by silently discarding them.
-- Can run an optional correctness checker configured in `.config/bork.json`.
-- Invokes the OpenAI Responses API in streaming mode.
-- Supports debug logging of LLM requests/responses via `BORK_ENABLE_DEBUG_LOG=1`.
-"""
-
-import difflib
-import errno
+import argparse
+import importlib
 import json
 import os
-import stat
 import subprocess
 import sys
-from collections.abc import Iterable, Mapping
-from pathlib import Path, PurePath
-from typing import Any, TypedDict, cast
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Final, Mapping, Sequence, cast
 
-from openai import OpenAI
-
-SKIP_DIRS = {".git", ".direnv", "__pycache__", ".claude"}
-
-CONFIG_REL_PATH = ".config/bork.json"
-
-# Per specs/llm-api-usage.md
-LLM_MODEL = "gpt-5.3-codex"
-LLM_REASONING_EFFORT = "high"
-
-ChangeSet = TypedDict("ChangeSet", {"create-or-update": dict[str, str], "delete": list[str]})
-BorkConfig = dict[str, object]
+MAX_ITERATIONS: Final[int] = 5
+MODEL_NAME: Final[str] = 'gpt-5.3-codex'
+REQUEST_TIMEOUT_SECONDS: Final[int] = 3600
+NON_UTF8_PLACEHOLDER: Final[str] = '<non-UTF8 output>'
+DEBUG_ENV_VAR: Final[str] = 'BORK_ENABLE_DEBUG_LOG'
+NL: Final[str] = chr(10)
+DOUBLE_NL: Final[str] = NL + NL
 
 
-def _empty_change_set() -> ChangeSet:
-    return {"create-or-update": {}, "delete": []}
+@dataclass(frozen=True)
+class BorkConfig:
+    correctness_checker: Path | None
+    edits_require_approval: set[PurePosixPath]
+    not_sent: set[PurePosixPath]
 
 
-def _dedupe_preserve_order(items: Iterable[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for item in items:
-        if item in seen:
-            continue
-        seen.add(item)
-        out.append(item)
-    return out
+@dataclass(frozen=True)
+class ToolCall:
+    call_id: str
+    name: str
+    arguments_json: str
 
 
-def _parse_change_set(raw: object) -> ChangeSet:
-    """Parse/validate a change-set JSON object.
-
-    Expected shape:
-      {
-        "create-or-update": {"path": "contents", ...},
-        "delete": ["path", ...]
-      }
-    """
-    if not isinstance(raw, dict):
-        raise ValueError("LLM output must be a JSON object")
-
-    payload = cast(Mapping[str, object], raw)
-    create_raw = payload.get("create-or-update", {})
-    delete_raw = payload.get("delete", [])
-
-    if create_raw is None:
-        create_raw = {}
-    if delete_raw is None:
-        delete_raw = []
-
-    if not isinstance(create_raw, dict) or not isinstance(delete_raw, list):
-        raise ValueError("LLM output must include 'create-or-update' object and 'delete' list")
-
-    create_map: dict[str, str] = {}
-    for rel, content in cast(dict[object, object], create_raw).items():
-        if not isinstance(rel, str):
-            raise ValueError("create-or-update keys must be strings")
-        if not isinstance(content, str):
-            raise ValueError(f"file contents for {rel} must be a string")
-        create_map[rel] = content
-
-    delete_list: list[str] = []
-    for rel in cast(list[object], delete_raw):
-        if not isinstance(rel, str):
-            raise ValueError("delete entries must be strings")
-        delete_list.append(rel)
-
-    return {"create-or-update": create_map, "delete": delete_list}
+def _debug_enabled() -> bool:
+    return os.getenv(DEBUG_ENV_VAR) == '1'
 
 
-def _debug_log_enabled() -> bool:
-    return os.environ.get("BORK_ENABLE_DEBUG_LOG") == "1"
+def _debug_log(message: str) -> None:
+    if _debug_enabled():
+        print(f'[debug] {message}', file=sys.stderr)
 
 
-def _debug_log_block(title: str, body: str) -> None:
-    if not _debug_log_enabled():
-        return
-    print(f"\n--- DEBUG: {title} ---", file=sys.stderr)
-    sys.stderr.write(body)
-    if not body.endswith("\n"):
-        sys.stderr.write("\n")
-    print(f"--- END DEBUG: {title} ---\n", file=sys.stderr)
-
-
-def _load_gitignore_patterns(root: Path) -> list[str]:
-    """Load top-level .gitignore patterns if present.
-
-    This is a minimal parser sufficient for typical ignore use in this repo.
-    """
-    gi = root / ".gitignore"
-    if not gi.exists():
-        return []
-
-    patterns: list[str] = []
-    for raw in gi.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        # ignore negation for now; spec only requires omitting gitignored files
-        if line.startswith("!"):
-            continue
-        patterns.append(line)
-    return patterns
-
-
-def _is_ignored(rel: str, patterns: list[str]) -> bool:
-    """Return True if rel path matches any .gitignore-like pattern.
-
-    Supports:
-      - exact directory ignores like ".venv/" and ".direnv/"
-      - exact file ignores
-      - simple globbing via fnmatch
-    """
-    import fnmatch
-
-    # normalize to forward slashes
-    rel = rel.replace(os.sep, "/")
-
-    parts = rel.split("/")
-    for pat in patterns:
-        pat = pat.strip()
-        if not pat:
-            continue
-        # normalize pattern to forward slashes
-        pat = pat.replace(os.sep, "/")
-
-        # directory pattern like ".venv/": ignore if any path segment equals ".venv"
-        if pat.endswith("/"):
-            d = pat[:-1]
-            if d in parts:
-                return True
-            # also match prefix directory
-            if rel.startswith(d + "/"):
-                return True
-            continue
-
-        # anchored pattern "/foo": treat as repo-root anchored
-        anchored = pat.startswith("/")
-        if anchored:
-            p = pat[1:]
-            if rel == p or rel.startswith(p + "/"):
-                return True
-            # allow glob anchored
-            if fnmatch.fnmatch(rel, p):
-                return True
-            continue
-
-        # unanchored
-        if rel == pat:
-            return True
-        if fnmatch.fnmatch(rel, pat):
-            return True
-        # also match basename for patterns without slashes
-        if "/" not in pat and fnmatch.fnmatch(parts[-1], pat):
-            return True
-
-    return False
-
-
-def _run_git(root: Path, args: list[str]) -> tuple[int, str, str]:
-    """Run a git command in root and return (returncode, stdout, stderr)."""
+def _decode_utf8_or_placeholder(data: bytes) -> str:
     try:
-        proc = subprocess.run(
-            ["git", *args],
-            cwd=str(root),
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        return proc.returncode, proc.stdout, proc.stderr
-    except FileNotFoundError:
-        return 127, "", "git not found"
-
-
-def _run_git_z(root: Path, args: list[str]) -> tuple[int, list[str], str]:
-    """Run a git command returning NUL-separated paths."""
-    try:
-        proc = subprocess.run(
-            ["git", *args],
-            cwd=str(root),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if proc.returncode != 0:
-            return proc.returncode, [], proc.stderr.decode("utf-8", errors="replace")
-        raw = proc.stdout.decode("utf-8", errors="replace")
-        items = [p for p in raw.split("\0") if p]
-        return 0, items, ""
-    except FileNotFoundError:
-        return 127, [], "git not found"
-
-
-def _in_git_repo(root: Path) -> bool:
-    rc, out, _ = _run_git(root, ["rev-parse", "--is-inside-work-tree"])
-    return rc == 0 and out.strip() == "true"
-
-
-def _git_ref_exists(root: Path, ref: str) -> bool:
-    rc, _, _ = _run_git(root, ["rev-parse", "--verify", "--quiet", ref])
-    return rc == 0
-
-
-def _choose_main_ref(root: Path) -> str | None:
-    for ref in ("main", "origin/main", "refs/remotes/origin/main"):
-        if _git_ref_exists(root, ref):
-            return ref
-    return None
-
-
-def _collect_files_via_git(root: Path, *, excluded_paths: set[str] | None = None) -> dict[str, str] | None:
-    """Collect files using git, respecting .gitignore via --exclude-standard.
-
-    Returns None if git isn't available or we aren't in a git repo.
-    """
-    if not _in_git_repo(root):
-        return None
-
-    excluded: set[str] = excluded_paths if excluded_paths is not None else set()
-    ignore_patterns = _load_gitignore_patterns(root)
-
-    # Tracked files (cached) + untracked (others) excluding ignored.
-    rc1, tracked, _ = _run_git_z(root, ["ls-files", "-z", "--cached"])
-    rc2, untracked, _ = _run_git_z(root, ["ls-files", "-z", "--others", "--exclude-standard"])
-    if rc1 != 0 and rc2 != 0:
-        return None
-
-    paths = sorted(set(tracked) | set(untracked))
-
-    files: dict[str, str] = {}
-    for rel in paths:
-        rel_norm = PurePath(rel).as_posix()
-        p = Path(rel_norm)
-        if any(part in SKIP_DIRS for part in p.parts):
-            continue
-        if rel_norm in excluded:
-            continue
-        if _is_ignored(rel_norm, ignore_patterns):
-            continue
-
-        abs_path = root / p
-        if not abs_path.is_file():
-            continue
-        try:
-            files[rel_norm] = abs_path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, PermissionError, OSError):
-            # Best-effort: omit binary/undecodable files.
-            pass
-    return files
-
-
-def _existing_not_sent_files(root: Path, not_sent_paths: set[str]) -> set[str]:
-    """Return configured not-sent paths that currently exist as non-ignored files."""
-    ignore_patterns = _load_gitignore_patterns(root)
-    existing: set[str] = set()
-
-    for rel in sorted(not_sent_paths):
-        if any(part in SKIP_DIRS for part in Path(rel).parts):
-            continue
-        if _is_ignored(rel, ignore_patterns):
-            continue
-
-        p = root / rel
-        try:
-            if p.is_file():
-                existing.add(rel)
-        except OSError:
-            continue
-
-    return existing
-
-
-def collect_files(root: Path) -> tuple[dict[str, str], set[str]]:
-    """Collect text files under root.
-
-    Omits:
-      - `.gitignore`'d files
-      - configured correctness checker
-      - configured `not-sent` file contents
-
-    Returns:
-      (files_with_contents, redacted_file_paths)
-    """
-    checker_rel = _configured_correctness_checker_repo_path(root)
-    not_sent_paths = _not_sent_paths_from_config(root)
-
-    redacted_paths = _existing_not_sent_files(root, not_sent_paths)
-    if checker_rel is not None:
-        redacted_paths.discard(checker_rel)
-
-    excluded_paths: set[str] = set(redacted_paths)
-    if checker_rel is not None:
-        excluded_paths.add(checker_rel)
-
-    git_files = _collect_files_via_git(root, excluded_paths=excluded_paths)
-    if git_files is not None:
-        return git_files, redacted_paths
-
-    # Fallback (no git): approximate using top-level .gitignore patterns.
-    files: dict[str, str] = {}
-    ignore_patterns = _load_gitignore_patterns(root)
-
-    for path in sorted(root.rglob("*")):
-        rel_path = path.relative_to(root)
-        if any(part in SKIP_DIRS for part in rel_path.parts):
-            continue
-        if not path.is_file():
-            continue
-
-        rel = rel_path.as_posix()
-        if rel in excluded_paths:
-            continue
-        if _is_ignored(rel, ignore_patterns):
-            continue
-
-        try:
-            files[rel] = path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, PermissionError, OSError):
-            pass
-
-    return files, redacted_paths
-
-
-def compute_specs_status(root: Path) -> tuple[str | None, str, list[str]]:
-    """Compute a diff of specs/ vs the main branch (best-effort) and list new untracked spec files.
-
-    Returns:
-      (baseline_ref, unified_diff_text, untracked_spec_files)
-
-    Notes:
-      - unified_diff_text is empty if there are no changes or diff couldn't be computed.
-      - untracked_spec_files are paths relative to repo root.
-    """
-    if not _in_git_repo(root):
-        return None, "", []
-
-    baseline = _choose_main_ref(root)
-
-    # New unstaged (untracked) spec files.
-    rc, out, _ = _run_git(root, ["ls-files", "--others", "--exclude-standard", "--", "specs/"])
-    untracked = [ln.strip() for ln in out.splitlines() if ln.strip()] if rc == 0 else []
-
-    diff_text = ""
-    if baseline is not None:
-        rc, out, _ = _run_git(root, ["diff", "--no-color", baseline, "--", "specs/"])
-        if rc == 0:
-            diff_text = out
-
-    return baseline, diff_text, untracked
-
-
-def build_prompt(
-    files: dict[str, str],
-    *,
-    redacted_paths: set[str] | None = None,
-    specs_baseline_ref: str | None = None,
-    specs_diff_text: str = "",
-    newly_added_specs: set[str] | None = None,
-    appended_text: str = "",
-) -> str:
-    """Build the concatenated codebase + specs prompt."""
-    redacted_paths = redacted_paths or set()
-    newly_added_specs = newly_added_specs or set()
-
-    # Optional: include a specs/ diff vs main branch, if present.
-    extra_sections: list[str] = []
-    if specs_diff_text.strip() or newly_added_specs:
-        if specs_baseline_ref is None:
-            header = "--- SPECS STATUS (baseline ref not found; unable to diff vs main) ---"
-        else:
-            header = f"--- SPECS DIFF VS {specs_baseline_ref} ---"
-
-        lines: list[str] = [header]
-        if specs_baseline_ref is not None:
-            if specs_diff_text.strip():
-                lines.append(specs_diff_text.rstrip("\n"))
-            else:
-                lines.append("(no textual diff output)")
-
-        # Per spec: new unstaged spec files are not duplicated in the input; their
-        # filepath is indicated as "newly added" in the file boundary markers below.
-        if newly_added_specs:
-            lines.append(
-                "Note: Newly added (untracked) spec files are marked as '(newly added)' in their file headers below."
-            )
-
-        lines.append("--- END SPECS STATUS ---")
-        extra_sections.append("\n".join(lines))
-
-    parts: list[str] = []
-    all_paths = sorted(set(files.keys()) | set(redacted_paths))
-    for path in all_paths:
-        tags: list[str] = []
-        if path in newly_added_specs:
-            tags.append("newly added")
-        if path in redacted_paths:
-            tags.append("contents omitted (configured as not-sent)")
-
-        tag_text = f" ({', '.join(tags)})" if tags else ""
-        header = f"--- FILE{tag_text}: {path} ---"
-
-        if path in redacted_paths:
-            content = "<contents omitted by harness (configured in .config/bork.json:not-sent)>"
-        else:
-            content = files[path]
-
-        parts.append(f"{header}\n{content}\n--- END FILE: {path} ---")
-
-    joined = "\n\n".join([*extra_sections, *parts])
-    if appended_text.strip():
-        joined = "\n\n".join([joined, appended_text.strip()])
-
-    return (
-        "You are a coding agent. Below is the entire contents of a repository, "
-        "including specification documents in specs/*.md.\n\n"
-        "Your job: determine what changes are needed to bring the codebase into "
-        "compliance with the specs.\n\n"
-        "Do not assume that any given piece of code is currently correct. "
-        "Treat the current codebase and the specs as potentially divergent, and reconcile them.\n\n"
-        "Changes to specs should be a last resort; by default, prefer changing code over changing specs. "
-        "Only change specs if they are contradictory.\n\n"
-        "Respond with ONLY a JSON object (no markdown fencing) with this exact schema:\n"
-        '{"create-or-update": {"filepath": "file contents", ...}, "delete": ["filepath", ...]}\n\n'
-        "If no changes are needed, return: "
-        '{"create-or-update": {}, "delete": []}\n\n'
-        "Notes:\n"
-        "- You may propose changes to any files, including specs in specs/*.md, but spec changes are discouraged and may require human approval to apply.\n"
-        "- Do not use filesystem traversal in paths (e.g., ../foo).\n"
-        "- All paths are relative to the source directory argument passed to the harness.\n\n"
-        f"{joined}"
-    )
-
-
-def _reject_path_traversal(rel: str) -> None:
-    """Reject paths that express traversal or are otherwise unsafe."""
-    if rel == "" or rel.strip() == "":
-        raise ValueError("empty path rejected")
-    if "\x00" in rel:
-        raise ValueError("NUL byte in path rejected")
-
-    # Disallow backslashes to avoid alternate separators on Windows and ambiguity.
-    if "\\" in rel:
-        raise ValueError(f"backslash in path rejected: {rel}")
-
-    p = PurePath(rel)
-
-    # Absolute paths or drive-qualified paths are rejected.
-    if p.is_absolute() or getattr(p, "drive", ""):
-        raise ValueError(f"absolute/drive path rejected: {rel}")
-
-    # Reject traversal and no-op segments.
-    if any(part in {"..", "."} for part in p.parts):
-        raise ValueError(f"path traversal segment rejected: {rel}")
-
-
-def _normalize_rel_path(rel: str) -> str:
-    """Normalize a validated relative path for comparisons.
-
-    This collapses redundant separators (e.g. ".config//bork.json"), without allowing
-    traversal (which is rejected earlier).
-    """
-    return PurePath(rel).as_posix()
-
-
-def _dir_fd_capable() -> bool:
-    """Return True if this platform/Python supports *at() style operations via dir_fd."""
-    required: tuple[Any, ...] = (os.open, os.mkdir, os.stat, os.unlink)
-    return all(func in os.supports_dir_fd for func in required)
-
-
-def _open_dir_no_symlink(name: str, *, dir_fd: int) -> int:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    return os.open(name, flags, dir_fd=dir_fd)
-
-
-def _safe_walk_dirs(root: Path, dir_parts: tuple[str, ...], *, create_missing: bool) -> tuple[int, list[int]]:
-    """Open a directory chain under root without following symlinks.
-
-    If create_missing is True, missing directories are created.
-
-    Returns: (leaf_dir_fd, fds_to_close)
-    """
-    root_fd = os.open(str(root), os.O_RDONLY | (os.O_DIRECTORY if hasattr(os, "O_DIRECTORY") else 0))
-    fds_to_close: list[int] = [root_fd]
-    current_fd = root_fd
-
-    for part in dir_parts:
-        while True:
-            try:
-                next_fd = _open_dir_no_symlink(part, dir_fd=current_fd)
-                fds_to_close.append(next_fd)
-                current_fd = next_fd
-                break
-            except FileNotFoundError:
-                if not create_missing:
-                    raise
-                # Create the directory; mkdir won't follow a symlink at the final component.
-                try:
-                    os.mkdir(part, 0o755, dir_fd=current_fd)
-                except FileExistsError:
-                    # Raced: something appeared; retry open which will reject symlinks.
-                    continue
-            except OSError as e:
-                # ELOOP is a typical indicator of symlink when using O_NOFOLLOW.
-                if e.errno in {errno.ELOOP, errno.ENOTDIR}:
-                    raise ValueError(f"symlink or non-directory path component rejected: {part}") from e
-                raise
-
-    return current_fd, fds_to_close
-
-
-def safe_write_text_under_root(root: Path, rel: str, content: str) -> None:
-    """Write a file under root while resisting traversal and symlink attacks."""
-    _reject_path_traversal(rel)
-    parts = Path(rel).parts
-    if not parts:
-        raise ValueError("empty path rejected")
-
-    # Best-effort robust implementation on POSIX using dir_fd.
-    if _dir_fd_capable():
-        parent_parts = parts[:-1]
-        filename = parts[-1]
-
-        fds_to_close: list[int] = []
-        try:
-            leaf_fd, fds_to_close = _safe_walk_dirs(root, tuple(parent_parts), create_missing=True)
-
-            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-
-            fd = os.open(filename, flags, 0o644, dir_fd=leaf_fd)
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-                f.write(content)
-            return
-        finally:
-            # Close in reverse order.
-            for fd in reversed(fds_to_close):
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-
-    # Fallback: path-based checks.
-    target = root / rel
-    # Ensure parent directories exist without following symlinks (best-effort).
-    current = root
-    for part in Path(rel).parts[:-1]:
-        current = current / part
-        if current.exists():
-            if current.is_symlink():
-                raise ValueError(f"symlink in path rejected: {current}")
-            if not current.is_dir():
-                raise NotADirectoryError(f"path component is not a directory: {current}")
-        else:
-            try:
-                current.mkdir()
-            except FileExistsError:
-                # Raced; re-check
-                if current.is_symlink():
-                    raise ValueError(f"symlink in path rejected: {current}")
-                if not current.is_dir():
-                    raise NotADirectoryError(f"path component is not a directory: {current}")
-
-    # Refuse to follow a symlink as the final component where supported.
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-
-    fd = os.open(str(target), flags, 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-        f.write(content)
-
-
-def safe_delete_under_root(root: Path, rel: str) -> None:
-    """Delete a file under root while resisting traversal and symlink attacks."""
-    _reject_path_traversal(rel)
-    parts = Path(rel).parts
-    if not parts:
-        raise ValueError("empty path rejected")
-
-    if _dir_fd_capable():
-        parent_parts = parts[:-1]
-        filename = parts[-1]
-        fds_to_close: list[int] = []
-        try:
-            try:
-                leaf_fd, fds_to_close = _safe_walk_dirs(root, tuple(parent_parts), create_missing=False)
-            except FileNotFoundError:
-                return
-
-            try:
-                st = os.stat(filename, dir_fd=leaf_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                return
-
-            if stat.S_ISDIR(st.st_mode):
-                raise IsADirectoryError(f"refusing to delete directory (files only): {rel}")
-
-            # Unlink removes the directory entry itself; it does not follow symlinks.
-            os.unlink(filename, dir_fd=leaf_fd)
-            return
-        finally:
-            for fd in reversed(fds_to_close):
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-
-    # Fallback: path-based.
-    target = root / rel
-    try:
-        st = target.lstat()
-    except FileNotFoundError:
-        return
-
-    if stat.S_ISDIR(st.st_mode):
-        raise IsADirectoryError(f"refusing to delete directory (files only): {rel}")
-
-    target.unlink()
-
-
-def _pending_spec_changes_path(root: Path) -> Path:
-    return root / ".claude" / "pending_spec_changes.json"
-
-
-def _merge_pending_spec_changes(root: Path, pending: ChangeSet) -> None:
-    """Persist pending spec changes for later manual review."""
-    p = _pending_spec_changes_path(root)
-
-    existing = _empty_change_set()
-    if p.exists():
-        try:
-            existing = _parse_change_set(json.loads(p.read_text(encoding="utf-8")))
-        except Exception:
-            # If unreadable/corrupt, overwrite.
-            existing = _empty_change_set()
-
-    merged_create = dict(existing["create-or-update"])
-    merged_create.update(pending["create-or-update"])
-
-    merged_delete = _dedupe_preserve_order([*existing["delete"], *pending["delete"]])
-
-    payload: ChangeSet = {"create-or-update": merged_create, "delete": merged_delete}
-    serialized = json.dumps(payload, indent=2, sort_keys=True) + "\n"
-    safe_write_text_under_root(root, ".claude/pending_spec_changes.json", serialized)
-
-
-def _pending_human_approval_changes_path(root: Path) -> Path:
-    return root / ".claude" / "pending_human_approval.json"
-
-
-def _merge_pending_human_approval_changes(root: Path, pending: ChangeSet) -> None:
-    """Persist pending non-spec changes which require human approval."""
-    p = _pending_human_approval_changes_path(root)
-
-    existing = _empty_change_set()
-    if p.exists():
-        try:
-            existing = _parse_change_set(json.loads(p.read_text(encoding="utf-8")))
-        except Exception:
-            existing = _empty_change_set()
-
-    merged_create = dict(existing["create-or-update"])
-    merged_create.update(pending["create-or-update"])
-
-    merged_delete = _dedupe_preserve_order([*existing["delete"], *pending["delete"]])
-
-    payload: ChangeSet = {"create-or-update": merged_create, "delete": merged_delete}
-    serialized = json.dumps(payload, indent=2, sort_keys=True) + "\n"
-    safe_write_text_under_root(root, ".claude/pending_human_approval.json", serialized)
-
-
-def _print_unified_diff(old: str, new: str, *, fromfile: str, tofile: str) -> None:
-    old_lines = old.splitlines(keepends=True)
-    new_lines = new.splitlines(keepends=True)
-    diff = difflib.unified_diff(old_lines, new_lines, fromfile=fromfile, tofile=tofile)
-    sys.stderr.writelines(diff)
-
-
-def _print_refused_create_attempt(rel: str, content: str, *, reason: str) -> None:
-    print(f"\n--- REFUSED CHANGE: {rel} ---", file=sys.stderr)
-    print(f"Reason: {reason}", file=sys.stderr)
-    print("--- ATTEMPTED CONTENTS ---", file=sys.stderr)
-    sys.stderr.write(content)
-    if not content.endswith("\n"):
-        sys.stderr.write("\n")
-    print("--- END ATTEMPTED CONTENTS ---", file=sys.stderr)
-    print(f"--- END REFUSED CHANGE: {rel} ---\n", file=sys.stderr)
-
-
-def _print_refused_delete_attempt(rel: str, *, reason: str) -> None:
-    print(f"\n--- REFUSED DELETE: {rel} ---", file=sys.stderr)
-    print(f"Reason: {reason}", file=sys.stderr)
-    print(f"--- END REFUSED DELETE: {rel} ---\n", file=sys.stderr)
-
-
-def _approve_spec_change(rel: str, *, action: str) -> bool:
-    """Request per-file human approval for spec changes."""
-    if not sys.stdin.isatty():
-        return False
-    prompt = f"Approve {action} to {rel}? Type 'yes' to approve: "
-    try:
-        ans = input(prompt)
-    except EOFError:
-        return False
-    return ans.strip().lower() == "yes"
-
-
-def _approve_human_required_change(rel: str, *, action: str) -> bool:
-    """Request per-file human approval for non-spec changes that require approval."""
-    if not sys.stdin.isatty():
-        return False
-    prompt = f"Approve {action} to {rel}? Type 'yes' to approve: "
-    try:
-        ans = input(prompt)
-    except EOFError:
-        return False
-    return ans.strip().lower() == "yes"
-
-
-def _is_protected_path(rel: str, protected_paths: set[str]) -> bool:
-    # Paths are already traversal-checked and backslashes are rejected.
-    return _normalize_rel_path(rel) in protected_paths
-
-
-def _normalize_configured_repo_path(raw: object) -> str | None:
-    """Normalize a configured safe relative path.
-
-    Accepts optional leading "./" and rejects:
-      - absolute paths
-      - drive-qualified paths
-      - backslashes
-      - NUL bytes
-      - traversal ("..")
-      - explicit no-op segments (".")
-    """
-    if not isinstance(raw, str):
-        return None
-
-    s = raw.strip()
-    if not s:
-        return None
-
-    if "\x00" in s or "\\" in s:
-        return None
-
-    # Accept and strip one or more leading "./".
-    while s.startswith("./"):
-        s = s[2:]
-
-    if s in {"", "."}:
-        return None
-
-    p = PurePath(s)
-
-    if p.is_absolute() or getattr(p, "drive", ""):
-        return None
-
-    if any(part in {"..", "."} for part in p.parts):
-        return None
-
-    return p.as_posix()
-
-
-def _configured_correctness_checker_repo_path(root: Path) -> str | None:
-    """Return configured correctness checker path as a normalized relative path, if valid."""
-    cfg, err = _read_bork_config(root)
-    if err is not None or cfg is None:
-        return None
-
-    checker = cfg.get("correctness-checker")
-    if checker is None:
-        return None
-
-    return _normalize_configured_repo_path(checker)
-
-
-def _protected_rel_paths(root: Path) -> set[str]:
-    """Return relative paths that are immutable to LLM-proposed edits."""
-    protected: set[str] = set()
-
-    checker_rel = _configured_correctness_checker_repo_path(root)
-    if checker_rel is not None:
-        protected.add(checker_rel)
-
-    return protected
-
-
-def _approval_requirements_from_config(root: Path) -> tuple[bool, set[str]]:
-    """Return (require_approval_for_all_edits, normalized_paths_requiring_approval)."""
-    cfg, err = _read_bork_config(root)
-
-    # If config exists but is invalid/unreadable, we conservatively require approval for all edits.
-    if err is not None:
-        print(f"Warning: {err}. Requiring human approval for all edits.", file=sys.stderr)
-        return True, set()
-
-    if cfg is None:
-        return False, set()
-
-    require_all = False
-    required: set[str] = set()
-
-    # edits-require-approval
-    era_value = cfg.get("edits-require-approval")
-    era_obj: object = [] if era_value is None else era_value
-
-    if not isinstance(era_obj, list):
-        print(
-            f"Warning: {CONFIG_REL_PATH} field 'edits-require-approval' must be a list of strings. "
-            "Requiring human approval for all edits.",
-            file=sys.stderr,
-        )
-        require_all = True
-    else:
-        for item in cast(list[object], era_obj):
-            normalized = _normalize_configured_repo_path(item)
-            if normalized is None:
-                print(
-                    f"Warning: ignoring invalid entry in edits-require-approval: {item!r} "
-                    "(must be a safe source-relative path)",
-                    file=sys.stderr,
-                )
-                continue
-            required.add(normalized)
-
-    return require_all, required
-
-
-def _not_sent_paths_from_config(root: Path) -> set[str]:
-    """Return normalized configured not-sent paths (relative to source directory)."""
-    cfg, err = _read_bork_config(root)
-    if err is not None:
-        print(f"Warning: {err}. Ignoring not-sent configuration.", file=sys.stderr)
-        return set()
-
-    if cfg is None:
-        return set()
-
-    ns_value = cfg.get("not-sent")
-    if ns_value is None:
-        return set()
-
-    if not isinstance(ns_value, list):
-        print(
-            f"Warning: {CONFIG_REL_PATH} field 'not-sent' must be a list of strings. Ignoring it.",
-            file=sys.stderr,
-        )
-        return set()
-
-    out: set[str] = set()
-    for item in cast(list[object], ns_value):
-        normalized = _normalize_configured_repo_path(item)
-        if normalized is None:
-            print(
-                f"Warning: ignoring invalid entry in not-sent: {item!r} (must be a safe source-relative path)",
-                file=sys.stderr,
-            )
-            continue
-        out.add(normalized)
-
-    return out
-
-
-def _read_text_best_effort(p: Path) -> str:
-    try:
-        if p.exists() and p.is_file():
-            return p.read_text(encoding="utf-8")
-    except Exception:
-        return ""
-    return ""
-
-
-def apply_changes(changes: ChangeSet, root: Path) -> None:
-    """Apply create-or-update and delete operations."""
-
-    create_map: dict[str, str] = dict(changes["create-or-update"])
-    delete_list: list[str] = list(changes["delete"])
-
-    # Validate and filter out unsafe paths.
-    validated_create: dict[str, str] = {}
-    for rel, content in create_map.items():
-        try:
-            _reject_path_traversal(rel)
-        except ValueError as e:
-            _print_refused_create_attempt(rel, content, reason=f"unsafe path rejected: {e}")
-            continue
-        validated_create[rel] = content
-
-    validated_delete: list[str] = []
-    for rel in delete_list:
-        try:
-            _reject_path_traversal(rel)
-        except ValueError as e:
-            _print_refused_delete_attempt(rel, reason=f"unsafe path rejected: {e}")
-            continue
-        validated_delete.append(rel)
-
-    create_map = validated_create
-    delete_list = validated_delete
-
-    protected_paths = _protected_rel_paths(root)
-    not_sent_paths = _not_sent_paths_from_config(root)
-    require_all_approval, approval_paths = _approval_requirements_from_config(root)
-
-    # Silently discard edits to not-sent paths (unless the path is protected for a stricter reason).
-    filtered_create: dict[str, str] = {}
-    for rel, content in create_map.items():
-        rel_norm = _normalize_rel_path(rel)
-        if rel_norm in not_sent_paths and rel_norm not in protected_paths:
-            continue
-        filtered_create[rel] = content
-
-    filtered_delete: list[str] = []
-    for rel in delete_list:
-        rel_norm = _normalize_rel_path(rel)
-        if rel_norm in not_sent_paths and rel_norm not in protected_paths:
-            continue
-        filtered_delete.append(rel)
-
-    create_map = filtered_create
-    delete_list = filtered_delete
-
-    def _requires_human_approval(rel: str) -> bool:
-        if require_all_approval:
-            return True
-        return _normalize_rel_path(rel) in approval_paths
-
-    # Split out spec changes for separate human approval.
-    normal_create: dict[str, str] = {}
-    spec_create: dict[str, str] = {}
-    for rel, content in create_map.items():
-        if Path(rel).parts[:1] == ("specs",):
-            spec_create[rel] = content
-        else:
-            normal_create[rel] = content
-
-    normal_delete: list[str] = []
-    spec_delete: list[str] = []
-    for rel in delete_list:
-        if Path(rel).parts[:1] == ("specs",):
-            spec_delete.append(rel)
-        else:
-            normal_delete.append(rel)
-
-    # Pending buckets.
-    pending_human: ChangeSet = _empty_change_set()
-
-    # Apply non-spec changes.
-    for rel, content in normal_create.items():
-        if _is_protected_path(rel, protected_paths):
-            _print_refused_create_attempt(
-                rel,
-                content,
-                reason=f"writes to protected path are forbidden ({_normalize_rel_path(rel)})",
-            )
-            continue
-
-        if _requires_human_approval(rel):
-            old_content = _read_text_best_effort(root / rel)
-            print(f"\n--- PROPOSED CHANGE (REQUIRES APPROVAL): {rel} ---", file=sys.stderr)
-            _print_unified_diff(old_content, content, fromfile=f"a/{rel}", tofile=f"b/{rel}")
-            print(f"--- END PROPOSED CHANGE: {rel} ---\n", file=sys.stderr)
-
-            if _approve_human_required_change(rel, action="update/create"):
-                safe_write_text_under_root(root, rel, content)
-                print(f"  wrote (approved): {rel}", file=sys.stderr)
-            else:
-                pending_human["create-or-update"][rel] = content
-                print(f"  pending (human approval required): {rel}", file=sys.stderr)
-            continue
-
-        safe_write_text_under_root(root, rel, content)
-        print(f"  wrote: {rel}", file=sys.stderr)
-
-    for rel in normal_delete:
-        if _is_protected_path(rel, protected_paths):
-            _print_refused_delete_attempt(
-                rel,
-                reason=f"deletes of protected path are forbidden ({_normalize_rel_path(rel)})",
-            )
-            continue
-
-        if _requires_human_approval(rel):
-            old_content = _read_text_best_effort(root / rel)
-            print(f"\n--- PROPOSED DELETE (REQUIRES APPROVAL): {rel} ---", file=sys.stderr)
-            _print_unified_diff(old_content, "", fromfile=f"a/{rel}", tofile=f"b/{rel}")
-            print(f"--- END PROPOSED DELETE: {rel} ---\n", file=sys.stderr)
-
-            if _approve_human_required_change(rel, action="delete"):
-                try:
-                    safe_delete_under_root(root, rel)
-                except IsADirectoryError:
-                    print(f"  skipping directory delete request (approved): {rel}", file=sys.stderr)
-                else:
-                    print(f"  deleted (approved): {rel}", file=sys.stderr)
-            else:
-                pending_human["delete"].append(rel)
-                print(f"  pending delete (human approval required): {rel}", file=sys.stderr)
-            continue
-
-        try:
-            safe_delete_under_root(root, rel)
-        except IsADirectoryError:
-            # Spec says delete files; if the model requests directory deletion, ignore.
-            print(f"  skipping directory delete request: {rel}", file=sys.stderr)
-            continue
-        print(f"  deleted: {rel}", file=sys.stderr)
-
-    if pending_human["create-or-update"] or pending_human["delete"]:
-        _merge_pending_human_approval_changes(root, pending_human)
-        print(
-            f"\nSome changes require human approval and were not applied. Pending changes written to: {Path('.claude') / 'pending_human_approval.json'}",
-            file=sys.stderr,
-        )
-        if not sys.stdin.isatty():
-            print(
-                "(Non-interactive stdin detected; approval-required changes were therefore deferred.)",
-                file=sys.stderr,
-            )
-
-    # Handle spec changes with per-file approval.
-    pending_spec: ChangeSet = _empty_change_set()
-
-    for rel, new_content in spec_create.items():
-        old_content = _read_text_best_effort(root / rel)
-
-        print(f"\n--- PROPOSED SPEC CHANGE: {rel} ---", file=sys.stderr)
-        _print_unified_diff(old_content, new_content, fromfile=f"a/{rel}", tofile=f"b/{rel}")
-        print(f"--- END PROPOSED SPEC CHANGE: {rel} ---\n", file=sys.stderr)
-
-        if _approve_spec_change(rel, action="update/create"):
-            safe_write_text_under_root(root, rel, new_content)
-            print(f"  wrote (approved spec change): {rel}", file=sys.stderr)
-        else:
-            pending_spec["create-or-update"][rel] = new_content
-            print(f"  pending (spec change requires approval): {rel}", file=sys.stderr)
-
-    for rel in spec_delete:
-        old_content = _read_text_best_effort(root / rel)
-        print(f"\n--- PROPOSED SPEC DELETE: {rel} ---", file=sys.stderr)
-        _print_unified_diff(old_content, "", fromfile=f"a/{rel}", tofile=f"b/{rel}")
-        print(f"--- END PROPOSED SPEC DELETE: {rel} ---\n", file=sys.stderr)
-
-        if _approve_spec_change(rel, action="delete"):
-            try:
-                safe_delete_under_root(root, rel)
-            except IsADirectoryError:
-                print(f"  skipping directory delete request (approved spec delete): {rel}", file=sys.stderr)
-            else:
-                print(f"  deleted (approved spec change): {rel}", file=sys.stderr)
-        else:
-            pending_spec["delete"].append(rel)
-            print(f"  pending (spec delete requires approval): {rel}", file=sys.stderr)
-
-    if pending_spec["create-or-update"] or pending_spec["delete"]:
-        _merge_pending_spec_changes(root, pending_spec)
-        print(
-            f"\nSpec changes were not fully applied. Pending changes written to: {Path('.claude') / 'pending_spec_changes.json'}",
-            file=sys.stderr,
-        )
-        if not sys.stdin.isatty():
-            print(
-                "(Non-interactive stdin detected; spec changes require human approval and were therefore deferred.)",
-                file=sys.stderr,
-            )
-
-
-def _read_bork_config(root: Path) -> tuple[BorkConfig | None, str | None]:
-    """Read `.config/bork.json` if present.
-
-    Returns: (config_dict_or_none, error_string_or_none)
-    """
-    cfg_path = root / CONFIG_REL_PATH
-    if not cfg_path.exists():
-        return None, None
-
-    try:
-        raw = cfg_path.read_text(encoding="utf-8")
-    except Exception as e:
-        return None, f"failed to read {CONFIG_REL_PATH}: {e}"
-
-    try:
-        data_raw = json.loads(raw)
-    except Exception as e:
-        return None, f"invalid JSON in {CONFIG_REL_PATH}: {e}"
-
-    if not isinstance(data_raw, dict):
-        return None, f"{CONFIG_REL_PATH} must contain a JSON object"
-
-    data = cast(BorkConfig, data_raw)
-    return data, None
-
-
-def _correctness_checker_configured_for_loop(root: Path) -> bool:
-    """Return True iff a correctness checker appears to be configured.
-
-    This is used to implement the edit-loop rule:
-      - Only loop once when there is no correctness checker.
-
-    If the config file exists but is unreadable/invalid, we conservatively return True
-    (treating the project as intending to use a checker).
-    """
-    cfg_path = root / CONFIG_REL_PATH
-    if not cfg_path.exists():
-        return False
-
-    try:
-        raw = cfg_path.read_text(encoding="utf-8")
-        data_raw = json.loads(raw)
-    except Exception:
-        return True
-
-    if not isinstance(data_raw, dict):
-        return True
-
-    data = cast(Mapping[str, object], data_raw)
-
-    if "correctness-checker" not in data:
-        return False
-
-    # If explicitly null, treat as not configured.
-    if data.get("correctness-checker") is None:
-        return False
-
-    return True
-
-
-def _decode_utf8_or_placeholder(b: bytes) -> str:
-    try:
-        return b.decode("utf-8")
+        return data.decode('utf-8')
     except UnicodeDecodeError:
-        return "<non-UTF8 output>"
+        return NON_UTF8_PLACEHOLDER
 
 
-def _format_block_for_prompt(title: str, payload: Mapping[str, object]) -> str:
-    return "\n".join(
-        [
-            f"--- {title} ---",
-            json.dumps(payload, indent=2, sort_keys=True),
-            f"--- END {title} ---",
-        ]
-    )
+def _find_repo_root(source_dir: Path) -> Path:
+    current = source_dir.resolve()
+    while True:
+        if (current / '.git').exists():
+            return current
+        if current.parent == current:
+            return source_dir.resolve()
+        current = current.parent
 
 
-def _run_correctness_checker(root: Path, checker_cmd: str) -> tuple[bool, str]:
-    """Run the configured correctness checker and interpret its result.
-
-    Contract (per specs/correctness-checker.md):
-      - invoked with no arguments in repo root
-      - exit 0: no findings
-      - exit 1: findings
-      - exit 2: failed to run
-      - stdout: JSON
-    """
-    if checker_cmd.strip() == "":
-        payload: dict[str, object] = {
-            "checker": checker_cmd,
-            "assessment": "failed-to-run",
-            "summary": "Invalid correctness-checker value (must be a non-empty string).",
-        }
-        return False, _format_block_for_prompt("CORRECTNESS CHECKER OUTPUT", payload)
-
-    try:
-        proc = subprocess.run(
-            [checker_cmd],
-            cwd=str(root),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-    except FileNotFoundError as e:
-        payload = {
-            "checker": checker_cmd,
-            "exit-code": 2,
-            "assessment": "failed-to-run",
-            "summary": "Correctness checker could not be executed (FileNotFoundError).",
-            "harness-error": str(e),
-        }
-        return False, _format_block_for_prompt("CORRECTNESS CHECKER OUTPUT", payload)
-    except PermissionError as e:
-        payload = {
-            "checker": checker_cmd,
-            "exit-code": 2,
-            "assessment": "failed-to-run",
-            "summary": "Correctness checker could not be executed (PermissionError).",
-            "harness-error": str(e),
-        }
-        return False, _format_block_for_prompt("CORRECTNESS CHECKER OUTPUT", payload)
-    except OSError as e:
-        payload = {
-            "checker": checker_cmd,
-            "exit-code": 2,
-            "assessment": "failed-to-run",
-            "summary": "Correctness checker could not be executed (OSError).",
-            "harness-error": str(e),
-        }
-        return False, _format_block_for_prompt("CORRECTNESS CHECKER OUTPUT", payload)
-
-    stdout = _decode_utf8_or_placeholder(proc.stdout)
-    stderr = _decode_utf8_or_placeholder(proc.stderr)
-    exit_code = proc.returncode
-
-    parsed_raw: object | None = None
-    parse_error: str | None = None
-
-    # Spec requires JSON on stdout; treat missing/invalid JSON as a contract violation.
-    if stdout == "<non-UTF8 output>":
-        parse_error = "stdout was not valid UTF-8"
-    else:
-        if not stdout.strip():
-            parse_error = "stdout was empty; expected JSON"
-        else:
-            try:
-                parsed_raw = json.loads(stdout)
-            except Exception as e:
-                parse_error = f"stdout was not valid JSON: {e}"
-
-    parsed: dict[str, object] | None = None
-    if parse_error is None:
-        if isinstance(parsed_raw, dict):
-            parsed = cast(dict[str, object], parsed_raw)
-        else:
-            parse_error = f"stdout JSON was not an object (got {type(parsed_raw).__name__})"
-
-    per_file_findings_obj: object | None = None
-    overall_findings_obj: object | None = None
-    if parsed is not None:
-        per_file_findings_obj = parsed.get("per_file_findings")
-        overall_findings_obj = parsed.get("overall_findings")
-
-    findings_count = 0
-    if isinstance(per_file_findings_obj, list):
-        per_file_findings = cast(list[object], per_file_findings_obj)
-        findings_count += len(per_file_findings)
-    if isinstance(overall_findings_obj, list):
-        overall_findings = cast(list[object], overall_findings_obj)
-        findings_count += len(overall_findings)
-
-    assessment = "unexpected"
-    ok = False
-
-    if exit_code == 0:
-        if parse_error is not None:
-            assessment = "failed-to-run"
-            ok = False
-        elif findings_count > 0:
-            assessment = "findings"
-            ok = False
-        else:
-            assessment = "no-findings"
-            ok = True
-    elif exit_code == 1:
-        # Findings are only meaningful if we can parse the JSON payload.
-        assessment = "findings" if parse_error is None else "failed-to-run"
-        ok = False
-    elif exit_code == 2:
-        assessment = "failed-to-run"
-        ok = False
-    else:
-        assessment = "unexpected-exit-code"
-        ok = False
-
-    payload: dict[str, object] = {
-        "checker": checker_cmd,
-        "exit-code": exit_code,
-        "assessment": assessment,
-        "stdout": stdout,
-        "stderr": stderr,
-        "parsed": parsed,
-    }
-    if parse_error is not None:
-        payload["parse-error"] = parse_error
-    if isinstance(per_file_findings_obj, list) or isinstance(overall_findings_obj, list):
-        payload["findings-count"] = findings_count
-
-    if ok:
-        return True, f"correctness checker OK (exit 0, no findings): {checker_cmd}"
-
-    # Failure: return a structured block for the next loop to consume.
-    return False, _format_block_for_prompt("CORRECTNESS CHECKER OUTPUT", payload)
-
-
-def run_correctness_checks(root: Path) -> tuple[bool, str, bool]:
-    """Run correctness checks.
-
-    If `.config/bork.json` exists and configures `correctness-checker`, run it.
-
-    Returns:
-      (ok, details, checker_was_configured)
-
-    Where:
-      - ok is True iff checks passed / produced no findings.
-      - details is a human/LLM-consumable string.
-      - checker_was_configured is True iff a `correctness-checker` command was present.
-
-    If no checker is configured, ok=True and checker_was_configured=False.
-    """
-    cfg, err = _read_bork_config(root)
-    if err is not None:
-        payload: dict[str, object] = {
-            "config": CONFIG_REL_PATH,
-            "assessment": "failed-to-run",
-            "summary": err,
-        }
-        return False, _format_block_for_prompt("CORRECTNESS CHECKER OUTPUT", payload), False
-
-    if cfg is None:
-        return True, f"no {CONFIG_REL_PATH}; skipping correctness checker", False
-
-    checker = cfg.get("correctness-checker")
-    if checker is None:
-        return True, "no correctness-checker configured; skipping correctness checker", False
-
-    if not isinstance(checker, str):
-        payload = {
-            "config": CONFIG_REL_PATH,
-            "assessment": "failed-to-run",
-            "summary": "Field 'correctness-checker' must be a string.",
-            "value": checker,
-        }
-        return False, _format_block_for_prompt("CORRECTNESS CHECKER OUTPUT", payload), False
-
-    ok, details = _run_correctness_checker(root, checker)
-    return ok, details, True
-
-
-def _wants_changes(changes: ChangeSet) -> bool:
-    return bool(changes["create-or-update"]) or bool(changes["delete"])
-
-
-def _as_mapping(value: object) -> Mapping[str, object] | None:
-    if not isinstance(value, Mapping):
+def _normalise_relative_path(raw: str) -> PurePosixPath | None:
+    path = PurePosixPath(raw)
+    if path.is_absolute() or not path.parts:
         return None
-    return cast(Mapping[str, object], value)
+    if any(part in ('', '.', '..') for part in path.parts):
+        return None
+    return path
 
 
-def _as_object_list(value: object) -> list[object] | None:
+def _coerce_str_object_dict(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    raw_dict = cast(dict[object, object], value)
+    result: dict[str, object] = {}
+    for key_obj, value_obj in raw_dict.items():
+        if not isinstance(key_obj, str):
+            return None
+        result[key_obj] = value_obj
+    return result
+
+
+def _coerce_object_list(value: object) -> list[object] | None:
     if not isinstance(value, list):
         return None
     return cast(list[object], value)
 
 
-def _extract_responses_api_output_text(response: object) -> str | None:
-    """Best-effort extraction of a text payload from the Responses API result."""
+def _getattr_object(obj: object, attr_name: str) -> object:
+    return cast(object, getattr(obj, attr_name, None))
 
-    # Newer SDKs expose an aggregated string.
-    output_text_obj: object = getattr(response, "output_text", None)
-    if isinstance(output_text_obj, str) and output_text_obj.strip() != "":
-        return output_text_obj
 
-    response_map = _as_mapping(response)
-    if response_map is not None:
-        ot_obj = response_map.get("output_text")
-        if isinstance(ot_obj, str) and ot_obj.strip() != "":
-            return ot_obj
+def _load_config(repo_root: Path) -> BorkConfig:
+    config_path = repo_root / '.config' / 'bork.json'
+    if not config_path.exists():
+        return BorkConfig(None, set(), set())
 
-    # Try to stitch together content blocks.
-    out_obj: object = getattr(response, "output", None)
-    if out_obj is None and response_map is not None:
-        out_obj = response_map.get("output")
+    raw_obj: object = json.loads(config_path.read_text(encoding='utf-8'))
+    raw_map = _coerce_str_object_dict(raw_obj)
+    if raw_map is None:
+        raise ValueError('Config must be a JSON object.')
 
-    out = _as_object_list(out_obj)
-    if out is None:
+    checker_obj = raw_map.get('correctness-checker')
+    checker_path: Path | None = None
+    if checker_obj is not None:
+        if not isinstance(checker_obj, str):
+            raise ValueError('correctness-checker must be a string when provided.')
+        candidate = (repo_root / checker_obj).resolve()
+        if not candidate.is_relative_to(repo_root.resolve()):
+            raise ValueError('correctness-checker must resolve within the Git repository root.')
+        checker_path = candidate
+
+    def parse_list(field_name: str) -> set[PurePosixPath]:
+        value_obj = raw_map.get(field_name)
+        if value_obj is None:
+            return set()
+        value_list = _coerce_object_list(value_obj)
+        if value_list is None:
+            raise ValueError(f'{field_name} must be a list.')
+
+        result: set[PurePosixPath] = set()
+        for item_obj in value_list:
+            if not isinstance(item_obj, str):
+                raise ValueError(f'{field_name} entries must be strings.')
+            normalised = _normalise_relative_path(item_obj)
+            if normalised is None:
+                raise ValueError(f'Invalid path in {field_name}: {item_obj}')
+            result.add(normalised)
+        return result
+
+    return BorkConfig(checker_path, parse_list('edits-require-approval'), parse_list('not-sent'))
+
+
+def _run_git(repo_root: Path, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ['git', '-C', str(repo_root), *args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _list_source_files(repo_root: Path, source_dir: Path) -> list[PurePosixPath]:
+    source_resolved = source_dir.resolve()
+    repo_resolved = repo_root.resolve()
+    source_rel_to_repo = source_resolved.relative_to(repo_resolved)
+
+    result = _run_git(
+        repo_root,
+        ['ls-files', '--cached', '--others', '--exclude-standard', '--full-name', '--', str(source_rel_to_repo)],
+    )
+
+    files: list[PurePosixPath] = []
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            repo_rel = Path(stripped)
+            try:
+                source_rel = repo_rel.relative_to(source_rel_to_repo)
+            except ValueError:
+                continue
+            normalised = _normalise_relative_path(source_rel.as_posix())
+            if normalised is not None:
+                files.append(normalised)
+        return sorted(files)
+
+    for path in source_dir.rglob('*'):
+        if not path.is_file():
+            continue
+        try:
+            rel = path.resolve().relative_to(source_resolved).as_posix()
+        except ValueError:
+            continue
+        normalised = _normalise_relative_path(rel)
+        if normalised is not None:
+            files.append(normalised)
+    return sorted(files)
+
+
+def _checker_source_relative(source_dir: Path, checker_path: Path | None) -> PurePosixPath | None:
+    if checker_path is None:
+        return None
+    try:
+        rel = checker_path.resolve().relative_to(source_dir.resolve()).as_posix()
+    except ValueError:
+        return None
+    return _normalise_relative_path(rel)
+
+
+def _safe_read_bytes(source_dir: Path, rel: PurePosixPath) -> bytes | None:
+    root = source_dir.resolve()
+    path = root / rel.as_posix()
+
+    if path.is_symlink():
         return None
 
-    texts: list[str] = []
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return None
 
-    for item in out:
-        item_map = _as_mapping(item)
-        content_obj: object
-        if item_map is not None:
-            content_obj = item_map.get("content")
-        else:
-            content_obj = getattr(item, "content", None)
+    if not resolved.is_relative_to(root):
+        return None
 
-        content = _as_object_list(content_obj)
-        if content is None:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def _render_codebase(
+    source_dir: Path,
+    files: Sequence[PurePosixPath],
+    checker_rel: PurePosixPath | None,
+    not_sent: set[PurePosixPath],
+) -> str:
+    chunks: list[str] = []
+    for rel in files:
+        rel_str = rel.as_posix()
+        if checker_rel is not None and rel == checker_rel:
             continue
 
-        for block in content:
-            block_map = _as_mapping(block)
-            if block_map is not None:
-                text_obj = block_map.get("text")
-                if isinstance(text_obj, str):
-                    texts.append(text_obj)
+        if rel in not_sent:
+            chunks.append(
+                f'''--- FILE: {rel_str} ---
+<contents omitted by not-sent policy>
+--- END FILE: {rel_str} ---'''
+            )
+            continue
+
+        file_bytes = _safe_read_bytes(source_dir, rel)
+        if file_bytes is None:
+            chunks.append(
+                f'''--- FILE: {rel_str} ---
+<contents omitted by path safety policy>
+--- END FILE: {rel_str} ---'''
+            )
+            continue
+
+        text = _decode_utf8_or_placeholder(file_bytes)
+        chunks.append(
+            f'''--- FILE: {rel_str} ---
+{text}
+--- END FILE: {rel_str} ---'''
+        )
+
+    return DOUBLE_NL.join(chunks)
+
+
+def _specs_diff_against_main(repo_root: Path, source_dir: Path) -> str:
+    source_rel_to_repo = source_dir.resolve().relative_to(repo_root.resolve())
+    specs_rel = source_rel_to_repo / 'specs'
+
+    diff_result = _run_git(repo_root, ['diff', 'main', '--', str(specs_rel)])
+    if diff_result.returncode != 0:
+        return ''
+
+    sections: list[str] = []
+    if diff_result.stdout.strip():
+        sections.append(diff_result.stdout.rstrip(NL))
+
+    new_specs_result = _run_git(
+        repo_root,
+        ['ls-files', '--others', '--exclude-standard', '--full-name', '--', str(specs_rel)],
+    )
+    if new_specs_result.returncode == 0:
+        newly_added: list[str] = []
+        for line in new_specs_result.stdout.splitlines():
+            stripped = line.strip()
+            if not stripped:
                 continue
-
-            t2_obj: object = getattr(block, "text", None)
-            if isinstance(t2_obj, str):
-                texts.append(t2_obj)
-
-    if not texts:
-        return None
-
-    return "".join(texts)
-
-
-def _extract_stream_event_text_delta(event: object) -> str | None:
-    """Extract output-text delta payload from a streaming Responses API event."""
-    event_map = _as_mapping(event)
-    event_type_obj: object
-    delta_obj: object
-    text_obj: object
-
-    if event_map is not None:
-        event_type_obj = event_map.get("type")
-        delta_obj = event_map.get("delta")
-        text_obj = event_map.get("text")
-    else:
-        event_type_obj = getattr(event, "type", None)
-        delta_obj = getattr(event, "delta", None)
-        text_obj = getattr(event, "text", None)
-
-    if not (
-        isinstance(event_type_obj, str)
-        and "output_text" in event_type_obj
-        and "delta" in event_type_obj
-    ):
-        return None
-
-    if isinstance(delta_obj, str):
-        return delta_obj
-
-    delta_map = _as_mapping(delta_obj)
-    if delta_map is not None:
-        delta_text_obj = delta_map.get("text")
-        if isinstance(delta_text_obj, str):
-            return delta_text_obj
-
-    delta_text_attr_obj: object = getattr(delta_obj, "text", None)
-    if isinstance(delta_text_attr_obj, str):
-        return delta_text_attr_obj
-
-    if isinstance(text_obj, str):
-        return text_obj
-
-    return None
-
-
-def _extract_stream_event_response(event: object) -> object | None:
-    """Best-effort extraction of a final response object from a stream event."""
-    event_map = _as_mapping(event)
-    if event_map is not None:
-        return event_map.get("response")
-    return getattr(event, "response", None)
-
-
-def _invoke_llm_streaming_attempt(client: OpenAI, kwargs: Mapping[str, object]) -> str:
-    """Invoke Responses API in streaming mode and return concatenated output text."""
-    chunks: list[str] = []
-    final_response: object | None = None
-
-    responses_api: Any = client.responses
-    stream_callable: Any = getattr(responses_api, "stream", None)
-
-    if callable(stream_callable):
-        stream_cm: Any = stream_callable(**kwargs)
-        with stream_cm as stream:
-            for event in stream:
-                if _debug_log_enabled():
-                    print(f"--- DEBUG: STREAM EVENT {getattr(event, 'type', type(event).__name__)} ---", file=sys.stderr)
-                delta = _extract_stream_event_text_delta(event)
-                if isinstance(delta, str) and delta:
-                    chunks.append(delta)
-
-                maybe_response = _extract_stream_event_response(event)
-                if maybe_response is not None:
-                    final_response = maybe_response
-
-            if final_response is None and hasattr(stream, "get_final_response"):
-                try:
-                    final_response = stream.get_final_response()
-                except Exception:
-                    final_response = None
-    else:
-        response_stream: Any = responses_api.create(stream=True, **kwargs)
-        for event in response_stream:
-            if _debug_log_enabled():
-                print(f"--- DEBUG: STREAM EVENT {getattr(event, 'type', type(event).__name__)} ---", file=sys.stderr)
-            delta = _extract_stream_event_text_delta(event)
-            if isinstance(delta, str) and delta:
-                chunks.append(delta)
-
-            maybe_response = _extract_stream_event_response(event)
-            if maybe_response is not None:
-                final_response = maybe_response
-
-        if final_response is None and hasattr(response_stream, "get_final_response"):
+            repo_rel = Path(stripped)
             try:
-                final_response = response_stream.get_final_response()
-            except Exception:
-                final_response = None
+                source_rel = repo_rel.relative_to(source_rel_to_repo)
+            except ValueError:
+                continue
+            normalised = _normalise_relative_path(source_rel.as_posix())
+            if normalised is not None:
+                newly_added.append(normalised.as_posix())
 
-    raw = "".join(chunks)
-    if raw.strip() == "" and final_response is not None:
-        extracted = _extract_responses_api_output_text(final_response)
-        if isinstance(extracted, str):
-            raw = extracted
+        if newly_added:
+            rendered = NL.join(f'{path} (newly added)' for path in sorted(set(newly_added)))
+            sections.append(
+                f'''--- NEW UNSTAGED SPECS FILES ---
+{rendered}
+--- END NEW UNSTAGED SPECS FILES ---'''
+            )
 
-    if raw.strip() == "":
-        raise ValueError("LLM returned empty streamed output text")
-
-    return raw
+    return DOUBLE_NL.join(sections)
 
 
-def _invoke_llm_via_responses_api(client: OpenAI, prompt: str) -> str:
-    """Invoke the LLM using the OpenAI Responses API.
+def _extract_tool_calls(response: object) -> list[ToolCall]:
+    output_obj = _getattr_object(response, 'output')
+    output_list = _coerce_object_list(output_obj)
+    if output_list is None:
+        return []
 
-    Per specs/llm-api-usage.md:
-      - model: gpt-5.3-codex
-      - reasoning: high
-      - timeout: configured on the client
-      - streaming mode enabled
+    calls: list[ToolCall] = []
+    for item in output_list:
+        item_type_obj = _getattr_object(item, 'type')
+        if item_type_obj != 'function_call':
+            continue
 
-    We request a JSON object output format.
+        call_id_obj = _getattr_object(item, 'call_id')
+        if not isinstance(call_id_obj, str):
+            fallback_id_obj = _getattr_object(item, 'id')
+            call_id_obj = fallback_id_obj if isinstance(fallback_id_obj, str) else None
 
-    Note: Codex-family models are not chat models; they must use the Responses API.
-    """
+        name_obj = _getattr_object(item, 'name')
+        args_obj = _getattr_object(item, 'arguments')
 
-    # Try a small set of argument spellings for compatibility across SDK versions,
-    # while preserving the same required semantics.
-    attempts: list[dict[str, object]] = [
+        if isinstance(call_id_obj, str) and isinstance(name_obj, str):
+            arguments_json = args_obj if isinstance(args_obj, str) else '{}'
+            calls.append(ToolCall(call_id=call_id_obj, name=name_obj, arguments_json=arguments_json))
+
+    return calls
+
+
+def _invoke_llm(prompt: str) -> str:
+    fake_output = os.getenv('BORK_FAKE_LLM_OUTPUT')
+    if fake_output is not None:
+        return fake_output
+
+    openai_module = importlib.import_module('openai')
+    openai_client_ctor = getattr(openai_module, 'OpenAI', None)
+    if openai_client_ctor is None:
+        raise RuntimeError('openai.OpenAI is unavailable.')
+
+    client = openai_client_ctor(timeout=REQUEST_TIMEOUT_SECONDS)
+
+    tools: list[dict[str, object]] = [
         {
-            "model": LLM_MODEL,
-            "input": prompt,
-            "reasoning": {"effort": LLM_REASONING_EFFORT},
-            "text": {"format": {"type": "json_object"}},
+            'type': 'function',
+            'name': 'resolve-spec-contradiction',
+            'description': 'Use when specs appear contradictory.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'spec-files': {'type': 'array', 'items': {'type': 'string'}},
+                    'snippets': {'type': 'array', 'items': {'type': 'string'}},
+                    'contradiction': {'type': 'string'},
+                },
+                'required': ['spec-files', 'snippets', 'contradiction'],
+            },
         },
         {
-            "model": LLM_MODEL,
-            "input": prompt,
-            "reasoning": {"effort": LLM_REASONING_EFFORT},
-            "response_format": {"type": "json_object"},
-        },
-        {
-            "model": LLM_MODEL,
-            "input": prompt,
-            "reasoning_effort": LLM_REASONING_EFFORT,
-            "text": {"format": {"type": "json_object"}},
-        },
-        {
-            "model": LLM_MODEL,
-            "input": prompt,
-            "reasoning_effort": LLM_REASONING_EFFORT,
-            "response_format": {"type": "json_object"},
+            'type': 'function',
+            'name': 'incomplete-spec',
+            'description': 'Use when specs are insufficient to make a decision.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'spec-files': {'type': 'array', 'items': {'type': 'string'}},
+                    'incompleteness': {'type': 'string'},
+                    'degrees-of-freedom': {'type': 'array', 'items': {'type': 'string'}},
+                },
+                'required': ['spec-files', 'incompleteness', 'degrees-of-freedom'],
+            },
         },
     ]
 
-    last_type_error: Exception | None = None
+    current_input: object = prompt
+    previous_response_id: str | None = None
 
-    for kwargs in attempts:
-        try:
-            return _invoke_llm_streaming_attempt(client, kwargs)
-        except TypeError as e:
-            # Different OpenAI SDK versions may not accept some kwargs.
-            last_type_error = e
+    while True:
+        _debug_log(f'LLM request input: {current_input!r}')
+        with client.responses.stream(
+            model=MODEL_NAME,
+            input=current_input,
+            previous_response_id=previous_response_id,
+            tools=tools,
+            reasoning={'effort': 'high'},
+        ) as stream:
+            for event in stream:
+                _debug_log(f'LLM stream event: {event!r}')
+            response = stream.get_final_response()
+
+        output_text_obj = _getattr_object(response, 'output_text')
+        output_text = output_text_obj if isinstance(output_text_obj, str) else ''
+        _debug_log(f'LLM response text: {output_text}')
+
+        tool_calls = _extract_tool_calls(response)
+        if not tool_calls:
+            return output_text
+
+        outputs: list[dict[str, str]] = []
+        for call in tool_calls:
+            print(
+                f'''Tool call requested: {call.name}
+Arguments:
+{call.arguments_json}
+Enter tool result:''',
+                file=sys.stderr,
+            )
+            tool_result = input()
+            outputs.append({'type': 'function_call_output', 'call_id': call.call_id, 'output': tool_result})
+
+        response_id_obj = _getattr_object(response, 'id')
+        if not isinstance(response_id_obj, str):
+            raise RuntimeError('Missing response id for tool-calling continuation.')
+        previous_response_id = response_id_obj
+        current_input = outputs
+
+
+def _parse_plan(raw: str) -> tuple[dict[PurePosixPath, str], list[PurePosixPath]]:
+    parsed_obj: object = json.loads(raw)
+    parsed_map = _coerce_str_object_dict(parsed_obj)
+    if parsed_map is None:
+        raise ValueError('LLM response must be a JSON object.')
+
+    create_obj = parsed_map.get('create-or-update', {})
+    create_map = _coerce_str_object_dict(create_obj)
+    if create_map is None:
+        raise ValueError('create-or-update must be an object.')
+
+    create: dict[PurePosixPath, str] = {}
+    for path_raw, value_obj in create_map.items():
+        rel = _normalise_relative_path(path_raw)
+        if rel is None:
+            continue
+        value_map = _coerce_str_object_dict(value_obj)
+        if value_map is None:
+            continue
+        contents_obj = value_map.get('contents')
+        if isinstance(contents_obj, str):
+            create[rel] = contents_obj
+
+    delete_obj = parsed_map.get('delete', [])
+    delete_list = _coerce_object_list(delete_obj)
+    if delete_list is None:
+        raise ValueError('delete must be a list.')
+
+    deletes: list[PurePosixPath] = []
+    for item_obj in delete_list:
+        item_map = _coerce_str_object_dict(item_obj)
+        if item_map is None:
+            continue
+        file_obj = item_map.get('file')
+        if isinstance(file_obj, str):
+            rel = _normalise_relative_path(file_obj)
+            if rel is not None:
+                deletes.append(rel)
+
+    return create, deletes
+
+
+def _ask_approval(prompt: str) -> bool:
+    print(f'{prompt} [y/N]', file=sys.stderr)
+    return input().strip().lower() in {'y', 'yes'}
+
+
+def _validated_target(source_dir: Path, rel: PurePosixPath) -> Path:
+    root = source_dir.resolve()
+    target = root / rel.as_posix()
+
+    cursor = root
+    for part in rel.parts[:-1]:
+        cursor = cursor / part
+        if cursor.exists() and cursor.is_symlink():
+            raise RuntimeError(f'Refusing symlinked parent path: {cursor}')
+
+    if target.exists() and target.is_symlink():
+        raise RuntimeError(f'Refusing symlinked target path: {target}')
+
+    if not target.parent.resolve().is_relative_to(root):
+        raise RuntimeError(f'Refusing path outside source directory: {target}')
+
+    return target
+
+
+def _apply_plan(
+    source_dir: Path,
+    create: Mapping[PurePosixPath, str],
+    deletes: Sequence[PurePosixPath],
+    config: BorkConfig,
+    checker_rel: PurePosixPath | None,
+) -> None:
+    for rel, contents in create.items():
+        if rel in config.not_sent:
             continue
 
-    raise TypeError(
-        "OpenAI Responses API invocation failed due to incompatible client library "
-        "(did not accept required arguments for reasoning effort and JSON formatting in streaming mode)."
-    ) from last_type_error
+        if checker_rel is not None and rel == checker_rel:
+            print(
+                f'''Refused immutable checker edit for {rel}:
+{contents}''',
+                file=sys.stderr,
+            )
+            continue
+
+        needs_approval = (rel.parts[0] == 'specs') or (rel in config.edits_require_approval)
+        if needs_approval and not _ask_approval(f'Approve write to {rel.as_posix()}?'):
+            continue
+
+        target = _validated_target(source_dir, rel)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(contents, encoding='utf-8')
+
+    for rel in deletes:
+        if rel in config.not_sent:
+            continue
+
+        if checker_rel is not None and rel == checker_rel:
+            print(f'Refused immutable checker delete for {rel}', file=sys.stderr)
+            continue
+
+        needs_approval = (rel.parts[0] == 'specs') or (rel in config.edits_require_approval)
+        if needs_approval and not _ask_approval(f'Approve delete of {rel.as_posix()}?'):
+            continue
+
+        target = _validated_target(source_dir, rel)
+        if target.exists() and target.is_file():
+            target.unlink()
 
 
-def _parse_source_dir_from_argv(argv: list[str]) -> Path:
-    prog = Path(argv[0]).name if argv else "harness.py"
-    if len(argv) != 2:
-        print(f"Usage: {prog} <source-directory>", file=sys.stderr)
-        raise SystemExit(2)
+def _run_correctness_checker(repo_root: Path, checker_path: Path) -> tuple[bool, str]:
+    try:
+        proc = subprocess.run(
+            [str(checker_path)],
+            cwd=repo_root,
+            check=False,
+            stdout=subprocess.PIPE,
+        )
+    except OSError as exc:
+        synthetic_failure = {
+            'per_file_findings': [],
+            'overall_findings': [
+                {
+                    'provenance': 'code-review',
+                    'finding': f'Failed to run correctness checker: {exc}',
+                }
+            ],
+        }
+        return True, json.dumps(synthetic_failure)
 
-    candidate = Path(argv[1]).expanduser()
-    if not candidate.exists() or not candidate.is_dir():
-        print(f"Source directory does not exist or is not a directory: {candidate}", file=sys.stderr)
-        raise SystemExit(2)
-
-    return candidate.resolve()
+    stdout = _decode_utf8_or_placeholder(proc.stdout)
+    return proc.returncode != 0, stdout
 
 
-def main(argv: list[str] | None = None) -> None:
-    argv = sys.argv if argv is None else argv
-    root = _parse_source_dir_from_argv(argv)
+def run(source_dir: Path) -> int:
+    source_dir = source_dir.resolve()
+    repo_root = _find_repo_root(source_dir)
+    config = _load_config(repo_root)
+    checker_rel = _checker_source_relative(source_dir, config.correctness_checker)
 
-    # Spec: only loop once when there is no correctness checker configured.
-    checker_configured_for_loop = _correctness_checker_configured_for_loop(root)
-    max_iterations = 5 if checker_configured_for_loop else 1
+    previous_checker_output: str | None = None
 
-    appended_failures: list[str] = []
+    for iteration in range(1, MAX_ITERATIONS + 1):
+        files = _list_source_files(repo_root, source_dir)
+        codebase = _render_codebase(source_dir, files, checker_rel, config.not_sent)
+        specs_diff = _specs_diff_against_main(repo_root, source_dir)
 
-    # Spec: use the most advanced OpenAI model (currently gpt-5.3-codex) with high reasoning,
-    # and a 1 hour timeout on requests.
-    client = OpenAI(timeout=60 * 60)
-
-    for iteration in range(1, max_iterations + 1):
-        specs_baseline, specs_diff_text, untracked_specs = compute_specs_status(root)
-        newly_added_specs = set(untracked_specs)
-
-        files, redacted_paths = collect_files(root)
-        protected_paths = sorted(_protected_rel_paths(root))
-        protected_display = ", ".join(protected_paths) if protected_paths else "(none)"
-
-        appendix_parts: list[str] = [
-            "--- HARNESS CONTEXT ---",
-            f"Iteration: {iteration} / {max_iterations}",
-            f"Protected (never edited) paths: {protected_display}",
-            f"Correctness checker configured (controls loop mode): {checker_configured_for_loop}",
-            "--- END HARNESS CONTEXT ---",
+        prompt_parts = [
+            'You are a coding agent reconciling code and specs.',
+            'Do not assume any code is currently correct.',
+            'Changes to specs are a last resort unless specs contradict each other.',
+            'If specs are contradictory or incomplete, use the provided tools.',
+            'Respond with ONLY a JSON object with keys high-level-description, implementation-decisions, create-or-update, and delete.',
+            codebase,
         ]
-        if appended_failures:
-            appendix_parts.append("--- CORRECTNESS CHECK FAILURES (most recent last) ---")
-            appendix_parts.extend(appended_failures)
-            appendix_parts.append("--- END CORRECTNESS CHECK FAILURES ---")
 
-        prompt = build_prompt(
-            files,
-            redacted_paths=redacted_paths,
-            specs_baseline_ref=specs_baseline,
-            specs_diff_text=specs_diff_text,
-            newly_added_specs=newly_added_specs,
-            appended_text="\n".join(appendix_parts),
-        )
+        if specs_diff:
+            prompt_parts.append(
+                f'''--- SPECS DIFF VS main ---
+{specs_diff}
+--- END SPECS DIFF VS main ---'''
+            )
 
-        print(
-            f"Collected {len(files)} files ({len(redacted_paths)} redacted); iteration {iteration}/{max_iterations}; sending to LLM...",
-            file=sys.stderr,
-        )
-        _debug_log_block("LLM REQUEST", prompt)
+        if previous_checker_output is not None:
+            prompt_parts.append(
+                f'''--- CORRECTNESS CHECKER OUTPUT ---
+{previous_checker_output}
+--- END CORRECTNESS CHECKER OUTPUT ---'''
+            )
 
-        raw = _invoke_llm_via_responses_api(client, prompt)
-        _debug_log_block("LLM RESPONSE", raw)
+        prompt = DOUBLE_NL.join(prompt_parts)
+        llm_raw = _invoke_llm(prompt)
+        create, deletes = _parse_plan(llm_raw)
+        _apply_plan(source_dir, create, deletes, config, checker_rel)
 
-        changes = _parse_change_set(json.loads(raw))
+        if config.correctness_checker is None:
+            return 0
 
-        if _wants_changes(changes):
-            print("Applying changes...", file=sys.stderr)
-            apply_changes(changes, root)
+        has_findings, checker_output = _run_correctness_checker(repo_root, config.correctness_checker)
+        if not has_findings:
+            return 0
 
-            ok, details, checker_was_configured = run_correctness_checks(root)
+        previous_checker_output = checker_output
 
-            # Spec: only loop once when there is no correctness checker.
-            if not checker_configured_for_loop:
-                print(f"Correctness checks: {details}", file=sys.stderr)
-                print("No correctness checker configured; single iteration complete.", file=sys.stderr)
-                return
+        if iteration == MAX_ITERATIONS:
+            print('Reached iteration limit with remaining findings; human intervention required.', file=sys.stderr)
+            return 1
 
-            # Spec: if five iterations take place and the model is still requesting changes,
-            # apply those changes and then break out, requesting human intervention.
-            if iteration >= max_iterations:
-                print(
-                    "Cycle limit reached (5 iterations) and model is still requesting changes. "
-                    "Latest changes were applied; human intervention requested.",
-                    file=sys.stderr,
-                )
-                return
-
-            if not ok:
-                appended_failures.append(details)
-                print("Correctness checks failed; commencing next loop.", file=sys.stderr)
-                continue
-
-            print(f"Correctness checks: {details}", file=sys.stderr)
-
-            # Spec: if there are no findings from the correctness checker after a change is applied,
-            # the loop ends.
-            if checker_was_configured:
-                print("No findings from correctness checker; ending loop.", file=sys.stderr)
-                return
-
-            # Defensive: checker_configured_for_loop should imply a checker is configured.
-            continue
-
-        # No changes requested by the model.
-        ok, details, _checker_was_configured = run_correctness_checks(root)
-        if ok:
-            print(f"Converged. Correctness checks: {details}", file=sys.stderr)
-            return
-
-        appended_failures.append(details)
-        print("Model requested no changes, but correctness checks failed; commencing next loop.", file=sys.stderr)
-
-    # Defensive: loop should have returned.
-    print("Cycle limit reached; human intervention requested.", file=sys.stderr)
+    return 1
 
 
-if __name__ == "__main__":
-    main(sys.argv)
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description='Bork reconciliation harness')
+    parser.add_argument('source_directory', type=Path)
+    args = parser.parse_args(argv)
+    return run(args.source_directory)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
