@@ -25,7 +25,7 @@
         };
 
         # The harness imports `openai`, so ensure the dev env provides it.
-        python = pkgs.python3.withPackages (ps: [ ps.openai ]);
+        python = pkgs.python3.withPackages (ps: [ ps.openai ps.tree-sitter ps.tree-sitter-python ]);
 
         devPackages = [
           pkgs.uv

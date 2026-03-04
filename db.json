@@ -1,0 +1,271 @@
+{
+  "code_database.py": [
+    [
+      "_normalise_relative_path",
+      "def _normalise_relative_path(raw: str) -> PurePosixPath | None",
+      "Validate and normalise a repository-relative path."
+    ],
+    [
+      "_find_repo_root",
+      "def _find_repo_root(source_dir: Path) -> Path",
+      "Find the nearest ancestor containing a .git directory."
+    ],
+    [
+      "_run_git",
+      "def _run_git(repo_root: Path, args: list[str]) -> subprocess.CompletedProcess[str]",
+      "Run a git command rooted at repo_root."
+    ],
+    [
+      "_list_source_files",
+      "def _list_source_files(repo_root: Path, source_dir: Path) -> list[PurePosixPath]",
+      "List files under source_dir, preferring git index semantics when available."
+    ],
+    [
+      "UnrecognisedLanguageError",
+      "RuntimeError",
+      "Raised when code database construction encounters a non-ingested language."
+    ],
+    [
+      "UnrecognisedLanguageError.__init__",
+      "def __init__(self, file_path: PurePosixPath) -> None",
+      null
+    ],
+    [
+      "_python_parser",
+      "def _python_parser() -> object",
+      "Create and cache a tree-sitter parser configured for Python."
+    ],
+    [
+      "_node_type",
+      "def _node_type(node: object) -> str",
+      "Return a node type for tree-sitter node-like objects."
+    ],
+    [
+      "_node_start",
+      "def _node_start(node: object) -> int",
+      "Return a node start byte offset."
+    ],
+    [
+      "_node_end",
+      "def _node_end(node: object) -> int",
+      "Return a node end byte offset."
+    ],
+    [
+      "_node_text",
+      "def _node_text(source_bytes: bytes, node: object) -> str",
+      "Extract source text for a node byte span."
+    ],
+    [
+      "_named_children",
+      "def _named_children(node: object) -> list[object]",
+      "Return named children for a node."
+    ],
+    [
+      "_field",
+      "def _field(node: object, field_name: str) -> object | None",
+      "Get a named field from a tree-sitter node-like object."
+    ],
+    [
+      "_definition_name",
+      "def _definition_name(source_bytes: bytes, node: object) -> str | None",
+      "Extract a class/function definition name."
+    ],
+    [
+      "_unwrap_decorated_definition",
+      "def _unwrap_decorated_definition(statement: object) -> object",
+      "Return the inner definition node when a statement is decorated."
+    ],
+    [
+      "_docstring_literal",
+      "def _docstring_literal(source_bytes: bytes, expression: object) -> str | None",
+      "Decode a docstring literal expression to a Python string."
+    ],
+    [
+      "_extract_docstring",
+      "def _extract_docstring(source_bytes: bytes, body_node: object | None) -> str | None",
+      "Extract the docstring from the first statement of a block."
+    ],
+    [
+      "_class_signature",
+      "def _class_signature(source_bytes: bytes, node: object) -> str",
+      "Render class inheritance data from a class definition node."
+    ],
+    [
+      "_function_signature",
+      "def _function_signature(source_bytes: bytes, node: object) -> str",
+      "Render a function signature from a function definition node."
+    ],
+    [
+      "_qualified",
+      "def _qualified(prefix: str, name: str) -> str",
+      "Build a qualified name by joining prefix and name."
+    ],
+    [
+      "_extract_python_definitions",
+      "def _extract_python_definitions(source: str, file_path: PurePosixPath) -> list[list[str | None]]",
+      "Extract class/function definitions, signatures, and docstrings from a Python file."
+    ],
+    [
+      "_extract_python_definitions.walk",
+      "def walk(block_node: object, prefix: str) -> None",
+      null
+    ],
+    [
+      "build_code_database",
+      "def build_code_database(source_dir: Path) -> CodeDatabase",
+      "Build the deterministic code database for a source directory."
+    ],
+    [
+      "write_code_database",
+      "def write_code_database(source_dir: Path, output_path: Path) -> None",
+      "Write the deterministic code database JSON file."
+    ],
+    [
+      "main",
+      "def main(argv: list[str] | None = None) -> int",
+      "Run the code database CLI entrypoint."
+    ]
+  ],
+  "harness.py": [
+    [
+      "BorkConfig",
+      "",
+      null
+    ],
+    [
+      "ToolCall",
+      "",
+      null
+    ],
+    [
+      "_debug_enabled",
+      "def _debug_enabled() -> bool",
+      null
+    ],
+    [
+      "_debug_log",
+      "def _debug_log(message: str) -> None",
+      null
+    ],
+    [
+      "_decode_utf8_or_placeholder",
+      "def _decode_utf8_or_placeholder(data: bytes) -> str",
+      null
+    ],
+    [
+      "_find_repo_root",
+      "def _find_repo_root(source_dir: Path) -> Path",
+      null
+    ],
+    [
+      "_normalise_relative_path",
+      "def _normalise_relative_path(raw: str) -> PurePosixPath | None",
+      null
+    ],
+    [
+      "_coerce_str_object_dict",
+      "def _coerce_str_object_dict(value: object) -> dict[str, object] | None",
+      null
+    ],
+    [
+      "_coerce_object_list",
+      "def _coerce_object_list(value: object) -> list[object] | None",
+      null
+    ],
+    [
+      "_getattr_object",
+      "def _getattr_object(obj: object, attr_name: str) -> object",
+      null
+    ],
+    [
+      "_load_config",
+      "def _load_config(repo_root: Path) -> BorkConfig",
+      null
+    ],
+    [
+      "_load_config.parse_list",
+      "def parse_list(field_name: str) -> set[PurePosixPath]",
+      null
+    ],
+    [
+      "_run_git",
+      "def _run_git(repo_root: Path, args: Sequence[str]) -> subprocess.CompletedProcess[str]",
+      null
+    ],
+    [
+      "_list_source_files",
+      "def _list_source_files(repo_root: Path, source_dir: Path) -> list[PurePosixPath]",
+      null
+    ],
+    [
+      "_checker_source_relative",
+      "def _checker_source_relative(source_dir: Path, checker_path: Path | None) -> PurePosixPath | None",
+      null
+    ],
+    [
+      "_safe_read_bytes",
+      "def _safe_read_bytes(source_dir: Path, rel: PurePosixPath) -> bytes | None",
+      null
+    ],
+    [
+      "_render_codebase",
+      "def _render_codebase(\n    source_dir: Path,\n    files: Sequence[PurePosixPath],\n    checker_rel: PurePosixPath | None,\n    not_sent: set[PurePosixPath],\n) -> str",
+      null
+    ],
+    [
+      "_specs_diff_against_main",
+      "def _specs_diff_against_main(repo_root: Path, source_dir: Path) -> str",
+      null
+    ],
+    [
+      "_extract_tool_calls",
+      "def _extract_tool_calls(response: object) -> list[ToolCall]",
+      null
+    ],
+    [
+      "_invoke_llm",
+      "def _invoke_llm(prompt: str) -> str",
+      null
+    ],
+    [
+      "_parse_plan",
+      "def _parse_plan(raw: str) -> tuple[str, list[str], dict[PurePosixPath, str], list[PurePosixPath]]",
+      null
+    ],
+    [
+      "_print_llm_commentary",
+      "def _print_llm_commentary(high_level_description: str, implementation_decisions: Sequence[str]) -> None",
+      null
+    ],
+    [
+      "_ask_approval",
+      "def _ask_approval(prompt: str) -> bool",
+      null
+    ],
+    [
+      "_validated_target",
+      "def _validated_target(source_dir: Path, rel: PurePosixPath) -> Path",
+      null
+    ],
+    [
+      "_apply_plan",
+      "def _apply_plan(\n    source_dir: Path,\n    create: Mapping[PurePosixPath, str],\n    deletes: Sequence[PurePosixPath],\n    config: BorkConfig,\n    checker_rel: PurePosixPath | None,\n) -> None",
+      null
+    ],
+    [
+      "_run_correctness_checker",
+      "def _run_correctness_checker(repo_root: Path, checker_path: Path) -> tuple[bool, str]",
+      null
+    ],
+    [
+      "run",
+      "def run(source_dir: Path, code_database_file: Path | None = None) -> int",
+      null
+    ],
+    [
+      "main",
+      "def main(argv: Sequence[str] | None = None) -> int",
+      null
+    ]
+  ]
+}

@@ -2,7 +2,10 @@
 name = "llm-take-the-wheel"
 version = "0.0.0"
 requires-python = ">=3.13"
-dependencies = ["openai"]
+dependencies = [
+    "openai",
+    "tree-sitter-python>=0.25.0",
+]
 
 [dependency-groups]
 dev = ["pyright"]
