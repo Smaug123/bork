@@ -405,11 +405,26 @@ Enter tool result:''',
         current_input = outputs
 
 
-def _parse_plan(raw: str) -> tuple[dict[PurePosixPath, str], list[PurePosixPath]]:
+def _parse_plan(raw: str) -> tuple[str, list[str], dict[PurePosixPath, str], list[PurePosixPath]]:
     parsed_obj: object = json.loads(raw)
     parsed_map = _coerce_str_object_dict(parsed_obj)
     if parsed_map is None:
         raise ValueError('LLM response must be a JSON object.')
+
+    high_level_obj = parsed_map.get('high-level-description', '')
+    if not isinstance(high_level_obj, str):
+        raise ValueError('high-level-description must be a string.')
+
+    decisions_obj = parsed_map.get('implementation-decisions', [])
+    decisions_list = _coerce_object_list(decisions_obj)
+    if decisions_list is None:
+        raise ValueError('implementation-decisions must be a list.')
+
+    implementation_decisions: list[str] = []
+    for decision_obj in decisions_list:
+        if not isinstance(decision_obj, str):
+            raise ValueError('implementation-decisions entries must be strings.')
+        implementation_decisions.append(decision_obj)
 
     create_obj = parsed_map.get('create-or-update', {})
     create_map = _coerce_str_object_dict(create_obj)
@@ -444,7 +459,23 @@ def _parse_plan(raw: str) -> tuple[dict[PurePosixPath, str], list[PurePosixPath]
             if rel is not None:
                 deletes.append(rel)
 
-    return create, deletes
+    return high_level_obj, implementation_decisions, create, deletes
+
+
+def _print_llm_commentary(high_level_description: str, implementation_decisions: Sequence[str]) -> None:
+    if high_level_description:
+        print(
+            f'''LLM high-level description:
+{high_level_description}''',
+            file=sys.stderr,
+        )
+
+    if not implementation_decisions:
+        return
+
+    print('LLM implementation decisions:', file=sys.stderr)
+    for decision in implementation_decisions:
+        print(f'- {decision}', file=sys.stderr)
 
 
 def _ask_approval(prompt: str) -> bool:
@@ -577,7 +608,8 @@ def run(source_dir: Path) -> int:
 
         prompt = DOUBLE_NL.join(prompt_parts)
         llm_raw = _invoke_llm(prompt)
-        create, deletes = _parse_plan(llm_raw)
+        high_level_description, implementation_decisions, create, deletes = _parse_plan(llm_raw)
+        _print_llm_commentary(high_level_description, implementation_decisions)
         _apply_plan(source_dir, create, deletes, config, checker_rel)
 
         if config.correctness_checker is None:
