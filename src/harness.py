@@ -570,7 +570,9 @@ def _run_correctness_checker(repo_root: Path, checker_path: Path) -> tuple[bool,
     return proc.returncode != 0, stdout
 
 
-def run(source_dir: Path) -> int:
+def run(source_dir: Path, code_database_file: Path | None = None) -> int:
+    _ = code_database_file
+
     source_dir = source_dir.resolve()
     repo_root = _find_repo_root(source_dir)
     config = _load_config(repo_root)
@@ -631,8 +633,9 @@ def run(source_dir: Path) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description='Bork reconciliation harness')
     parser.add_argument('source_directory', type=Path)
+    parser.add_argument('code_database_file', type=Path, nargs='?')
     args = parser.parse_args(argv)
-    return run(args.source_directory)
+    return run(args.source_directory, args.code_database_file)
 
 
 if __name__ == '__main__':

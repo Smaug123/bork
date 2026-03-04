@@ -29,8 +29,10 @@ The function signature (or inheritance data, or whatever analogous concept) is f
 
 # Constructing the database
 
-The Bork system contains a standalone tool which can deterministically construct the database.
+The Bork system contains a standalone component, separate from the [edit-loop harness](./edit-loop.md), which can deterministically construct the database.
 It uses tree-sitter to parse each file in the codebase and render the necessary information from it.
+
+It can be called as a standalone command line, or programmatically from within the harness.
 
 The following languages are implemented for ingestion into the database:
 
