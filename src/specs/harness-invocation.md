@@ -8,7 +8,9 @@ The [edit loop](./edit-loop.md) describes the Bork harness which constructs an a
 
 # Invocation
 
-The user invokes this harness by supplying a single positional argument on the command line: a source directory.
-(The agent is constrained to read and write within this source directory.)
+The user invokes this harness by supplying the following positional arguments on the command line:
+
+* a source directory, within which the agent is constrained to read and write;
+* an optional [code database file](./code-database.md) to read from and write to (although neither reading nor writing from the harness is currently implemented).
 
 The harness is executable on Unix.
