@@ -9,7 +9,7 @@ It doesn't use this database anywhere, but future extensions to Bork will permit
 
 This database lives outside the code, so is not directly accessible to the LLM through the harness.
 
-The harness is simply a JSON file listing all the relevant definitions in the code.
+The database is simply a JSON file listing all the relevant definitions in the code.
 Here is a representative example, although it is not prescriptive: the system actually stores whatever can most conveniently be extracted from the code deterministically.
 
 ```json
@@ -30,9 +30,10 @@ The function signature (or inheritance data, or whatever analogous concept) is f
 # Constructing the database
 
 The Bork system contains a standalone component, separate from the [edit-loop harness](./edit-loop.md), which can deterministically construct the database.
-It uses tree-sitter to parse each file in the codebase and render the necessary information from it.
-
 It can be called as a standalone command line, or programmatically from within the harness.
+The component is implemented, though its consuming logic in the harness is not yet implemented.
+
+It uses tree-sitter to parse each file in the codebase and render the necessary information from it.
 
 The following languages are implemented for ingestion into the database:
 
